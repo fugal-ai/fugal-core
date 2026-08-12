@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+# Fugal — Apache-2.0. See NOTICE.
+"""
+fetch_backbone.py — download the one thing this repo does not ship: the backbone.
+
+    python scripts/fetch_backbone.py
+
+Fetches Qwen/Qwen3-0.6B (Apache-2.0, ~1.5 GB) from HuggingFace into artifacts/Qwen3-0.6B,
+which is where FUGAL_MODEL points by default — so after this, everything just runs.
+
+Already have Qwen3-0.6B on disk? Skip this and set FUGAL_MODEL to that directory instead.
+
+Nothing fetched here is committed to the repo; see NOTICE. The router head
+(data/router_head.npz, 73 KB) is original work and ships with the repo — it is the only
+other thing the router needs.
+"""
+from __future__ import annotations
+import os, sys
+
+MODEL_ID = "Qwen/Qwen3-0.6B"
+ART = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "artifacts")
+DEST = os.path.join(ART, "Qwen3-0.6B")
+# What a usable checkout must contain. Checked afterwards rather than assumed: the original
+# failure mode of this script was printing "Done" over an incomplete download and letting the
+# router die with a confusing error several commands later.
+REQUIRED = ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"]
+
+
+def main():
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        sys.exit("pip install -r requirements.txt   (huggingface_hub is needed to fetch)")
+
+    os.makedirs(ART, exist_ok=True)
+    print(f"fetching {MODEL_ID} (Apache-2.0, ~1.5 GB) -> {DEST}")
+    snapshot_download(MODEL_ID, local_dir=DEST)
+
+    missing = [f for f in REQUIRED if not os.path.exists(os.path.join(DEST, f))]
+    if missing:
+        sys.exit(f"\nFATAL: {DEST} is missing {', '.join(missing)}. The download did not "
+                 f"complete; re-run this script.")
+
+    print(f"\nDone. Backbone at {DEST}")
+    print("Try it (no API key, no spend):")
+    print('  python -m fugal --route "what is 15% of 240?"')
+
+
+if __name__ == "__main__":
+    main()

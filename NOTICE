@@ -1,0 +1,50 @@
+Fugal
+Copyright 2026 The Fugal Contributors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this project except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+ATTRIBUTION & THIRD-PARTY MATERIAL
+================================================================================
+
+Fugal is an independent, open reverse-engineering and reimplementation of
+the ideas behind Sakana AI's "Fugu" orchestrator family. It is NOT affiliated
+with, endorsed by, or derived from Sakana AI's proprietary product code.
+
+This repository derives from the open reverse-engineering effort at
+github.com/trotsky1997/OpenFugu (Apache-2.0) and adds the Fugal routing layer
+on top of the ideas in its TRINITY reconstruction.
+
+This repository contains ONLY original code, documentation, and analysis
+authored by the Fugal contributors. It deliberately does NOT redistribute any
+third-party source, weights, or datasets. The one third-party artifact it uses
+is fetched at setup time by `scripts/fetch_backbone.py`, directly from its
+original source:
+
+1. TRINITY: An Evolved LLM Coordinator (arXiv:2512.04695), Sakana AI.
+   Fugal's router design derives from this work. Fugal does not depend on any
+   TRINITY artifact at runtime: it runs on an unmodified Qwen/Qwen3-0.6B
+   backbone with its own 17-model head. This is an acknowledgement, not a
+   dependency.
+
+2. Learning to Orchestrate Agents in Natural Language with the Conductor
+   (arXiv:2512.04388), Sakana AI. Referenced for the Conductor mechanism.
+
+3. Backbone model: Qwen/Qwen3-0.6B (Apache-2.0), Alibaba Cloud. Downloaded
+   from HuggingFace at setup time; never redistributed here.
+
+4. Worker pool: any model reachable through OpenRouter. Credentials are
+   supplied by the user via environment variables, never stored, never logged.
+
+================================================================================
+TRAINED WEIGHTS
+================================================================================
+
+The router head (`data/router_head.npz`) is original work of this project: a
+linear utility head fit offline against this project's own model x question
+evidence matrix. It is distributed under Apache-2.0 with the rest of this
+repository. See `docs/HEAD_FORMAT.md` for its contract.

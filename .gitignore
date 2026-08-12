@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv*/
+# third-party material fetched by scripts/fetch_backbone.py — never redistributed (see NOTICE)
+artifacts/
+# ...and as a SYMLINK, which `artifacts/` does not match: the deployed checkout links
+# artifacts -> /opt/fugal/artifacts, so the trailing slash left it showing untracked.
+/artifacts
+*.safetensors
+*.npy
+.env
+# local rollback copies (e.g. serve.py.bak-trim) — git history is the real backup
+*.bak-*

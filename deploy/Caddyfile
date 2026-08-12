@@ -1,0 +1,31 @@
+# Reference reverse-proxy for Fugal.
+#
+# Puts TLS + a public hostname in front of `python -m fugal --serve` on :8090. Append this
+# block to whatever Caddy owns :80/:443, or run it standalone. This is the API only — Fugal
+# itself enforces the request tiers, rate limits and spend caps (see deploy/README.md); Caddy
+# just terminates TLS and forwards.
+
+your-domain.example {
+	encode zstd gzip
+
+	# Route mode is $0; answers are token-gated and spend-capped in fugal/serve.py.
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8090 {
+			flush_interval -1   # SSE: stream tokens as they arrive, don't buffer
+		}
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:8090
+	}
+}
+
+# NOTE on the upstream address:
+#   - Caddy installed on the host  → 127.0.0.1:8090 (as above).
+#   - Caddy running in a CONTAINER → 127.0.0.1 is the container itself; use
+#     host.docker.internal:8090 and give the caddy service
+#     extra_hosts: ["host.docker.internal:host-gateway"] in compose.
+#
+# Keep :8090 closed to the public internet regardless — Fugal binds 0.0.0.0 only so a
+# containerised proxy can reach it over the docker bridge; a host firewall (or the cloud
+# provider's security list) is what makes it unreachable from outside. Verify with
+# `curl --max-time 5 http://PUBLIC_IP:8090/health` from off-box — it must time out.

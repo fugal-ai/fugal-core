@@ -1,0 +1,8 @@
+# The router: one local forward pass of Qwen3-0.6B. No generation, CPU is fine.
+torch>=2.4
+transformers>=4.52,<5
+numpy
+# Worker calls (OpenRouter) — only used when you actually answer a question.
+requests
+# One-time backbone download: scripts/fetch_backbone.py
+huggingface_hub

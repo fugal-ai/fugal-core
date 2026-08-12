@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Seconds. Syntax, data integrity, and the hygiene gate that keeps this repo public.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: All Python compiles
+        run: python -m compileall -q fugal scripts verify
+
+      - name: Shell scripts parse
+        run: bash -n deploy/setup_arm.sh
+
+      - name: Price sheet is valid JSON and covers the head
+        run: |
+          pip install -q numpy
+          python - <<'PY'
+          import json, numpy as np
+          z = np.load("data/router_head.npz", allow_pickle=True)
+          models = [str(m) for m in z["models"]]
+          n = len(models)
+          assert z["W"].shape == (n, 1024), z["W"].shape
+          assert z["b"].shape == (n,) and z["mean_cost"].shape == (n,)
+          priced = {m["id"] for m in json.load(open("data/models_2026-06.json"))}
+          missing = [m for m in models if m not in priced]
+          assert not missing, f"no price for {missing}"
+          print(f"head OK: {n} models, lambda={float(z['lam']):g}, all priced")
+          PY
+
+      # This repo is the public half of a codebase whose private half runs billing. A
+      # string from that half landing here is the one mistake that cannot be undone after
+      # a push, so it fails the build rather than waiting for review to catch it.
+      - name: No billing, auth, or cascade strings
+        run: |
+          if git grep -nEi 'supabase|sk-fugal|sk-fugu|credit_micro|bill_margin|ledger|oauth|cascade|escalat|verifier|model_iter_60|openfugu-(web|core)' \
+               -- . ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::forbidden string found (see matches above)"
+            exit 1
+          fi
+          echo "clean"
+
+  # Minutes. Proves the product actually routes — a green badge that only ran compileall
+  # would be worse than no badge.
+  routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache the backbone
+        uses: actions/cache@v4
+        with:
+          path: artifacts/Qwen3-0.6B
+          key: qwen3-0.6b-${{ hashFiles('scripts/fetch_backbone.py') }}
+
+      - name: Install (CPU torch)
+        run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q transformers numpy requests huggingface_hub
+
+      - name: Fetch the backbone
+        run: python scripts/fetch_backbone.py
+
+      # The product's core promise: one model call per turn, multi-turn included.
+      # Mocked worker, so this spends nothing and needs no key.
+      - name: Routing is one call per turn
+        run: python verify/verify_routing.py
+
+      - name: --route picks a model the head actually scores
+        run: |
+          python -m fugal --route "what is 15% of 240?" | tee route.txt
+          python - <<'PY'
+          import numpy as np
+          models = {str(m) for m in np.load("data/router_head.npz", allow_pickle=True)["models"]}
+          picked = [l.split()[0] for l in open("route.txt") if "<-- WORKER" in l]
+          assert len(picked) == 1, f"expected one WORKER line, got {len(picked)}"
+          assert picked[0] in models, f"{picked[0]} is not one of the head's models"
+          print("routed to", picked[0])
+          PY
+
+      - name: The server starts and /v1/route costs nothing
+        run: |
+          python -m fugal --serve --port 8090 &
+          for i in $(seq 1 60); do
+            curl -sf localhost:8090/health >/dev/null && break || sleep 2
+          done
+          curl -sf localhost:8090/health | tee health.json
+          curl -sf localhost:8090/v1/models
+          curl -sf -X POST localhost:8090/v1/route -H 'Content-Type: application/json' \
+               -d '{"query":"reverse a linked list in python"}' | head -c 300
+          python -c "import json;h=json.load(open('health.json'));assert h['spend_usd']==0,h"
