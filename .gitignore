@@ -3,8 +3,7 @@ __pycache__/
 .venv*/
 # third-party material fetched by scripts/fetch_backbone.py — never redistributed (see NOTICE)
 artifacts/
-# ...and as a SYMLINK, which `artifacts/` does not match: the deployed checkout links
-# artifacts -> /opt/fugal/artifacts, so the trailing slash left it showing untracked.
+# ...and as a SYMLINK, which `artifacts/` (trailing slash) does not match.
 /artifacts
 *.safetensors
 *.npy

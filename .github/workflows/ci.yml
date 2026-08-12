@@ -20,9 +20,6 @@ jobs:
       - name: All Python compiles
         run: python -m compileall -q fugal scripts verify
 
-      - name: Shell scripts parse
-        run: bash -n deploy/setup_arm.sh
-
       - name: Price sheet is valid JSON and covers the head
         run: |
           pip install -q numpy

@@ -159,6 +159,34 @@ an `X-Fugal-Cost-USD` header — so you can always see who answered and what it 
 
 ---
 
+## 6. Keeping it running
+
+Nothing here needs a deployment recipe — `--serve` on localhost is the whole thing. If you want
+it up across reboots, a systemd unit is enough:
+
+```ini
+[Unit]
+Description=Fugal router
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/fugal-core
+EnvironmentFile=/etc/fugal.env        # mode 600: FUGAL_API_KEY, FUGAL_SERVE_TOKEN
+Environment=FUGAL_MODEL=/path/to/fugal-core/artifacts/Qwen3-0.6B
+ExecStart=/path/to/.venv/bin/python -m fugal --serve --port 8090 --spend-cap 25.00
+Restart=on-failure
+MemoryMax=6G                          # fp32 Qwen3-0.6B is ~2.4 GB; loading peaks above that
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If you expose it beyond localhost: set `FUGAL_SERVE_TOKEN`, put TLS in front of it, and
+remember that the outermost spend brake is the hard limit on the OpenRouter key itself, not
+`--spend-cap`. Serving it to anonymous strangers is a different problem than this repo solves.
+
+---
+
 ## Known limits
 
 - **Plain-chat history is capped** at 12 messages / 24k chars (`clean_history`), 8/8k on the

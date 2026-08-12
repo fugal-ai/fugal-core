@@ -112,7 +112,6 @@ data/models_2026-06.json    price sheet, USD per million tokens
 docs/HEAD_FORMAT.md         the .npz contract, and the limits of subsetting
 docs/INTEGRATION.md         wiring Fugal into Claude Code / OpenClaw / SDKs
 verify/verify_routing.py    the core promise: exactly one model call per turn
-deploy/                     systemd + Caddy for a CPU-only box
 ```
 
 Two knobs worth knowing. `--router-lambda` overrides the head's cost sensitivity (shipped:
@@ -139,7 +138,7 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
   is where the router's design comes from. See `NOTICE`. Fugal is independent of, and not
   affiliated with, Sakana AI.
 - What is added here: the utility head over 17 current models, the price-discounted decision
-  rule, the OpenAI/Anthropic serving shapes, and a deployment recipe.
+  rule, and the OpenAI/Anthropic serving shapes.
 - Fugal no longer depends on any TRINITY artifact at runtime — it runs on an unmodified
   Qwen3-0.6B backbone with its own head.
 
