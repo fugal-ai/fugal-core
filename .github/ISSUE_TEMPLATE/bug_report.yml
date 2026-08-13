@@ -1,0 +1,70 @@
+name: Bug report
+description: Something behaves differently from what the docs say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: `POST /v1/route` and `python -m fugal --route "..."` cost nothing and
+        need no key. If you can reproduce the problem there, say so — it rules out the
+        entire worker-call path and makes this much faster to fix.
+
+        **Never paste an API key**, including in logs or a `curl -v` dump.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you got, what you expected.
+      placeholder: |
+        $ python -m fugal --route "..."
+        ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - Routing / the head (--route, /v1/route)
+        - Serving — OpenAI shape (/v1/chat/completions)
+        - Serving — Anthropic shape (/v1/messages)
+        - Streaming
+        - Tool calling
+        - Spend caps / rate limiting / auth
+        - Setup (fetch_backbone, install, deploy)
+        - Docs
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Output of the local checks
+      description: |
+        Run whichever are relevant and paste the output. They need no key and spend nothing.
+      value: |
+        $ python verify/verify_head.py
+
+        $ python -m unittest discover -s tests
+
+        $ python verify/verify_routing.py
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`git rev-parse --short HEAD`, or the release tag"
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:
+        python --version:
+        pip show torch transformers numpy | grep -i version:
+        Backbone: fetched with scripts/fetch_backbone.py / own Qwen3-0.6B checkout
+        Head: shipped data/router_head.npz / own via FUGAL_HEAD
+    validations:
+      required: true

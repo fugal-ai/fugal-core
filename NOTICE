@@ -15,15 +15,39 @@ Fugal is an independent, open reverse-engineering and reimplementation of
 the ideas behind Sakana AI's "Fugu" orchestrator family. It is NOT affiliated
 with, endorsed by, or derived from Sakana AI's proprietary product code.
 
-This repository derives from the open reverse-engineering effort at
-github.com/trotsky1997/OpenFugu (Apache-2.0) and adds the Fugal routing layer
-on top of the ideas in its TRINITY reconstruction.
+--------------------------------------------------------------------------------
+OpenFugu
+Copyright 2026 The OpenFugu Contributors
+Licensed under the Apache License, Version 2.0.
+Source: github.com/trotsky1997/OpenFugu
+--------------------------------------------------------------------------------
 
-This repository contains ONLY original code, documentation, and analysis
-authored by the Fugal contributors. It deliberately does NOT redistribute any
-third-party source, weights, or datasets. The one third-party artifact it uses
-is fetched at setup time by `scripts/fetch_backbone.py`, directly from its
-original source:
+Fugal is a DERIVATIVE WORK of OpenFugu and the above attribution is reproduced
+per Apache-2.0 section 4(d). Portions of `fugal/router.py` are derived from
+OpenFugu's `openfugu/mini.py` (Apache-2.0), specifically the router's
+hidden-state extraction path: `ROUTER_SYSTEM_PROMPT`, `HIDDEN_POS`,
+`format_transcript`, and `FugalRouter.hidden`.
+
+Changes made by Fugal to that material, per Apache-2.0 section 4(b):
+
+  - The SVF (singular-value fine-tuning) backbone adaptation was REMOVED. Fugal
+    runs an unmodified Qwen/Qwen3-0.6B and depends on no TRINITY checkpoint.
+  - The bias-free (10, 1024) agent/role logit head was REPLACED by Fugal's own
+    (17, 1024) per-model logistic head with bias, plus the price-discounted
+    decision rule `utility = p - lam * mean_cost`.
+  - The hidden state is L2-normalised before scoring; OpenFugu does not
+    normalise it.
+  - The multi-turn Coordinator loop, its role injection, and its termination
+    conditions were not carried over: Fugal makes ONE worker call per turn.
+  - Everything in `fugal/serve.py`, `scripts/`, `verify/`, `deploy/`, `docs/`
+    and `data/router_head.npz` is original to Fugal.
+
+OpenFugu's own NOTICE attributes the material below, which is reproduced here
+because it pertains to the derived routing path. Fugal contains ONLY original
+code, documentation and analysis apart from the derivation described above, and
+deliberately does NOT redistribute any third-party source, weights, or datasets.
+The one third-party artifact it uses is fetched at setup time by
+`scripts/fetch_backbone.py`, directly from its original source:
 
 1. TRINITY: An Evolved LLM Coordinator (arXiv:2512.04695), Sakana AI.
    Fugal's router design derives from this work. Fugal does not depend on any

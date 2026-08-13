@@ -1,0 +1,41 @@
+name: Routing quality
+description: The router picked a model you think is wrong
+labels: ["routing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you file, because both are expected behaviour:
+
+        - **The head reads the latest message only**, and was fit on standalone questions.
+          On a follow-up turn ("now in Rust") the signal is genuinely weaker.
+        - **Cost is a tiebreaker, not a driver.** At the shipped `λ=2.0` the accuracy spread
+          across the 17 models usually dominates price. `--router-lambda 10` will show you
+          how much of the decision the cost term is actually making.
+
+        A disagreement about one question is hard to act on; a pattern, or a case where
+        `p_solve` is confidently wrong, is very actionable. If you have graded outcomes,
+        `docs/EVALUATION.md` turns this into a measurement.
+  - type: textarea
+    id: table
+    attributes:
+      label: The routing table
+      description: "Output of `python -m fugal --route \"<your question>\"` — costs nothing."
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Which model you expected, and how you know
+      description: >
+        Did the chosen model actually answer incorrectly? Did another one answer correctly?
+        "I'd have guessed a bigger model" is a fine thing to say — just say that it is a
+        guess, so it is not read as a measurement.
+    validations:
+      required: true
+  - type: input
+    id: lam
+    attributes:
+      label: Does it change at a different --router-lambda?
+      placeholder: "e.g. same pick at 0, 2 and 10"

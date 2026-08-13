@@ -12,6 +12,8 @@ Usage:
       # FUGAL_SERVE_TOKEN; --spend-cap is a hard cumulative USD ceiling.
       # GET /health, GET /v1/models, POST /v1/route ($0, no key), POST /v1/chat/completions,
       # POST /v1/messages.
+      # Browsers are locked out by default: no CORS headers unless --cors-origin says so,
+      # and on a loopback bind the Host header must name loopback (DNS rebinding).
 
 Add --models "a,b,c" (or set FUGAL_MODELS) to route among a subset of the head's 17 models —
 useful when you hold keys for some providers and not others. See docs/HEAD_FORMAT.md.
@@ -19,8 +21,9 @@ useful when you hold keys for some providers and not others. See docs/HEAD_FORMA
 Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone directory).
 """
 from __future__ import annotations
-import argparse, io, json, os, sys, threading, time, uuid
+import argparse, hmac, json, os, sys, threading, time, uuid
 
+from ._console import use_utf8
 from .router import Fugal, clamp_max_tokens, compose_system, or_request, or_call  # noqa: F401
 
 
@@ -215,7 +218,7 @@ def route_repl(models=None, router_lambda=None):
 
 # ---- the server --------------------------------------------------------------
 def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
-          router_lambda=None, models=None):
+          router_lambda=None, models=None, cors_origins=None, allow_hosts=None):
     """OpenAI- and Anthropic-compatible endpoint. Threaded, optional bearer auth
     (FUGAL_SERVE_TOKEN), a hard cumulative spend cap, and /health + /v1/models.
 
@@ -227,12 +230,28 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
       - POST /v1/chat/completions | /v1/messages without a token — allowed ONLY when
         --daily-cap is set; counts against a per-UTC-day budget + per-IP rate limit.
       - With the FUGAL_SERVE_TOKEN bearer — bypasses the daily cap and rate limit
-        (still bounded by the cumulative --spend-cap safety net)."""
+        (still bounded by the cumulative --spend-cap safety net).
+
+    Browser defences, both ON by default because the documented way to run this is
+    `--serve` on localhost with NO token and a live OpenRouter key:
+      - No CORS headers are sent unless an origin is explicitly allowed
+        (`cors_origins` / --cors-origin / FUGAL_CORS_ORIGINS). Reflecting whatever
+        Origin arrived would let any page the user happens to visit spend their
+        credit from the browser and read the answer back.
+      - When bound to loopback, the Host header must name loopback (or something
+        passed to `allow_hosts`). That is what stops DNS rebinding: an attacker
+        resolving evil.example to 127.0.0.1 arrives with Host: evil.example."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from collections import deque
     from datetime import datetime, timezone
     f2 = Fugal(models=models, router_lambda=router_lambda)
     token = os.environ.get("FUGAL_SERVE_TOKEN")          # None => no auth (localhost)
+    cors = set(cors_origins or [])
+    # Host checking applies only to a loopback bind. Bound to 0.0.0.0 the server is
+    # behind a reverse proxy (docs/INTEGRATION.md), which forwards the public hostname — there
+    # is no rebinding to defend against and a fixed allowlist would just reject traffic.
+    loopback_bind = host in ("127.0.0.1", "localhost", "::1")
+    hosts_ok = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in (allow_hosts or [])}
     meter = {"spent": 0.0, "n": 0, "day": None, "day_spent": 0.0}
     mlock = threading.Lock()
     hits = {}                                            # ip -> deque[timestamps]
@@ -290,10 +309,46 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             self.wfile.write(data)
 
         def _cors(self):
+            """CORS headers — ONLY for an origin that was explicitly allowed.
+
+            Returning nothing is the safe default: without Access-Control-Allow-Origin
+            the browser refuses to hand the response back to the page, so a drive-by
+            fetch from an unrelated site cannot read answers (or preflight its way to
+            sending an Authorization header). Pass --cors-origin to opt a real web app
+            in; '*' is accepted but means any page on the internet."""
             origin = self.headers.get("Origin")
-            if origin:
+            if not origin or not cors:
+                return []
+            if "*" in cors:
+                return [("Access-Control-Allow-Origin", "*")]
+            if origin in cors:
                 return [("Access-Control-Allow-Origin", origin), ("Vary", "Origin")]
-            return [("Access-Control-Allow-Origin", "*")]
+            return []
+
+        def _host_ok(self):
+            """Host header names this machine (loopback binds only) — anti-DNS-rebinding.
+
+            A page on evil.example whose DNS answer is 127.0.0.1 reaches this server with
+            the browser's same-origin policy satisfied; CORS never enters into it. The
+            Host header is the one field that still carries the attacker's name."""
+            if not loopback_bind:
+                return True
+            h = (self.headers.get("Host") or "").strip().lower()
+            if not h:
+                return False
+            if h.startswith("["):                       # [::1]:8090
+                name = h[1:h.find("]")] if "]" in h else h
+            else:                                       # host:port, or a bare IPv6 literal
+                name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+            return name in hosts_ok
+
+        def _guard(self):
+            """True if the request may proceed; otherwise the 403 has already been sent."""
+            if self._host_ok():
+                return True
+            self._err(403, "Host header not allowed; reach this server as localhost, "
+                           "or pass --allow-host", "permission_error")
+            return False
 
         def _err(self, code, msg, typ="invalid_request_error"):
             self._json(code, {"error": {"message": msg, "type": typ}})
@@ -308,9 +363,12 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             return (self.headers.get("x-api-key") or "").strip()
 
         def _authed(self):
+            # compare_digest, not ==, so a network attacker cannot walk the token out
+            # one byte at a time off response timing — this token is the only thing between
+            # a reachable port and a live OpenRouter key.
             if not token:
                 return True
-            return self._auth_value() == token
+            return hmac.compare_digest(self._auth_value(), token)
 
         def _client_ip(self):
             # trust X-Forwarded-For only when the peer is the local reverse proxy
@@ -326,8 +384,17 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 return spend_cap is not None and meter["spent"] >= spend_cap
 
         def do_OPTIONS(self):
+            if not self._guard():
+                return
+            hdrs = self._cors()
+            if self.headers.get("Origin") and not hdrs:
+                # Fail the preflight explicitly rather than 204-ing without the header:
+                # the browser blocks the real request either way, but a 403 tells whoever
+                # is configuring a legitimate web app that --cors-origin is what they want.
+                return self._err(403, "origin not allowed; start the server with "
+                                      "--cors-origin https://your.app", "permission_error")
             self.send_response(204)
-            for k, v in self._cors():
+            for k, v in hdrs:
                 self.send_header(k, v)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers",
@@ -336,6 +403,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             self.end_headers()
 
         def do_GET(self):
+            if not self._guard():
+                return
             path = self.path.rstrip("/") or "/"
             if path == "/health":
                 with mlock:
@@ -414,6 +483,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
 
         def do_POST(self):
             try:
+                if not self._guard():
+                    return
                 path = self.path.rstrip("/") or "/"
                 if path in ("/v1/route", "/route"):
                     return self._route_only()
@@ -641,6 +712,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
            if daily_cap is not None else "public tier OFF (token required for answers)")
     print(f"Fugal serving on http://{host}:{port}/v1/chat/completions  [{auth}; {cap}; {pub}]")
     print(f"  routing among {len(f2.models)} models, lambda={f2.lam:g}")
+    print(f"  browser: CORS {'allowed for ' + ', '.join(sorted(cors)) if cors else 'OFF'}"
+          f"; Host check {'ON (' + ', '.join(sorted(hosts_ok)) + ')' if loopback_bind else 'OFF (non-loopback bind)'}")
     if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):
         # Say it at startup rather than letting every answer come back as a 401 from
         # OpenRouter that reads like our bug.
@@ -657,14 +730,9 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
 
 def main():
     # The ranked table, the help text and the error messages use em-dashes; a Windows
-    # console defaults to cp1252 and mangles or raises on them. stderr needs this as much as
-    # stdout — argparse and sys.exit() write there. Only when run as a program: importing
+    # console defaults to cp1252 and raises on them. Only when run as a program: importing
     # fugal.serve must not reach in and rebind a library user's streams.
-    for _name in ("stdout", "stderr"):
-        _s = getattr(sys, _name)
-        if hasattr(_s, "buffer"):
-            setattr(sys, _name,
-                    io.TextIOWrapper(_s.buffer, encoding="utf-8", errors="replace"))
+    use_utf8()
     ap = argparse.ArgumentParser(
         prog="python -m fugal",
         description="Fugal — one forward pass picks the model, then calls it once.")
@@ -684,7 +752,21 @@ def main():
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--spend-cap", type=float, default=None,
-                    help="serve only: cumulative USD ceiling; past it the server returns 402")
+                    help="serve only: cumulative USD ceiling; past it the server returns 402. "
+                         "A brake, not an accounting record: it is checked before each call, "
+                         "so concurrent requests can overshoot it slightly, it resets on "
+                         "restart, and it counts the price sheet's numbers — run "
+                         "scripts/refresh_prices.py to keep those true. Set a hard limit on "
+                         "the OpenRouter key as well.")
+    ap.add_argument("--cors-origin", action="append", default=None, metavar="ORIGIN",
+                    help="serve only: allow browser requests from this origin (repeatable; "
+                         "also FUGAL_CORS_ORIGINS, comma-separated). Default is NO CORS at "
+                         "all, which is what stops an unrelated web page from spending your "
+                         "credit. '*' allows everything.")
+    ap.add_argument("--allow-host", action="append", default=None, metavar="HOST",
+                    help="serve only: extra value accepted in the Host header. Only enforced "
+                         "on a loopback bind, where it is the DNS-rebinding defence; "
+                         "localhost and 127.0.0.1 are always allowed.")
     ap.add_argument("--daily-cap", type=float, default=None,
                     help="serve only: enable the tokenless PUBLIC tier with this shared "
                          "USD budget per UTC day (unset = answers require the bearer token)")
@@ -706,9 +788,13 @@ def main():
         reply, meta = f2.answer(args.query, verbose=True)
         print(f"\nanswer ({meta['final_model']}, ${meta['cost']:.5f}):\n{reply}")
     elif args.serve:
+        env_cors = [o.strip() for o in
+                    (os.environ.get("FUGAL_CORS_ORIGINS") or "").split(",") if o.strip()]
         serve(args.port, host=args.host, spend_cap=args.spend_cap,
               daily_cap=args.daily_cap, rate_limit=args.rate_limit,
-              router_lambda=args.router_lambda, models=args.models)
+              router_lambda=args.router_lambda, models=args.models,
+              cors_origins=(args.cors_origin or []) + env_cors,
+              allow_hosts=args.allow_host)
     else:
         ap.print_help()
 

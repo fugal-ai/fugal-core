@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fugal"
+version = "1.0.0"                     # keep in step with fugal/__init__.py; CI asserts it
+description = "One forward pass picks the model, then calls it once."
+readme = "README.md"
+requires-python = ">=3.10"            # PEP 604 unions in router.py / serve.py
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The Fugal Contributors" }]
+keywords = ["llm", "router", "routing", "openrouter", "inference", "cost"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The router: one local forward pass, no generation, CPU is fine. `requests` is only
+# reached when you actually answer a question; `huggingface_hub` only by
+# scripts/fetch_backbone.py. They are hard dependencies anyway because a router that
+# cannot call a worker is not the product.
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.52",
+    "numpy>=1.24",
+    "requests>=2.28",
+    "huggingface_hub>=0.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/jtdoherty/fugal-core"
+Source = "https://github.com/jtdoherty/fugal-core"
+Issues = "https://github.com/jtdoherty/fugal-core/issues"
+
+[project.scripts]
+fugal = "fugal.serve:main"
+
+[tool.setuptools]
+packages = ["fugal"]
+
+# INSTALL FROM A CLONE, EDITABLE:
+#
+#     pip install -e .
+#     python scripts/fetch_backbone.py
+#     fugal --route "what is 15% of 240?"
+#
+# `pip install -e .` is the supported mode, and this is not laziness about packaging. The
+# router needs two things that are not Python: data/router_head.npz (73 KB, ships with the
+# repo) and a ~1.5 GB Qwen3-0.6B checkout in artifacts/. fugal/router.py resolves both
+# relative to the repo root. A non-editable wheel dropped in site-packages would import
+# fine and then fail at the first route with a path error, which is a worse experience
+# than not offering it. If you want Fugal as a library inside another tree, point
+# FUGAL_HEAD, FUGAL_PRICES and FUGAL_MODEL at wherever you keep those files.
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
+
+[tool.ruff.lint]
+# Deliberately narrow. This repo's style — dense one-line imports, aligned tables, long
+# explanatory comments — is intentional, and a linter that fights it would cost more than
+# it catches. These are the rules that find real bugs.
+select = ["E9", "F63", "F7", "F82", "F401", "F811", "B"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"fugal/serve.py" = ["F401"]           # re-exports or_request/or_call for library users

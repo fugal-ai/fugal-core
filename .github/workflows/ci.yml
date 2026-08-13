@@ -18,11 +18,33 @@ jobs:
           python-version: "3.12"
 
       - name: All Python compiles
-        run: python -m compileall -q fugal scripts verify
+        run: python -m compileall -q fugal scripts verify tests
+
+      # Milliseconds, no backbone, no network: the wire-shape adapters are pure functions,
+      # and they are where a bug does NOT raise — a dropped tool_call_id just hangs a tool
+      # loop. numpy is the only dependency reaching them (via router.py).
+      - name: Wire-shape adapter tests
+        run: |
+          pip install -q numpy
+          python -m unittest discover -s tests -v
+
+      - name: Head properties (pure numpy, no backbone)
+        run: python verify/verify_head.py
+
+      - name: Declared version matches the package
+        run: |
+          python - <<'PY'
+          import re, pathlib
+          pt = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          ini = pathlib.Path("fugal/__init__.py").read_text(encoding="utf-8")
+          a = re.search(r'^version = "([^"]+)"', pt, re.M).group(1)
+          b = re.search(r'__version__ = "([^"]+)"', ini).group(1)
+          assert a == b, f"pyproject {a} != fugal.__version__ {b}"
+          print("version", a)
+          PY
 
       - name: Price sheet is valid JSON and covers the head
         run: |
-          pip install -q numpy
           python - <<'PY'
           import json, numpy as np
           z = np.load("data/router_head.npz", allow_pickle=True)
@@ -101,3 +123,41 @@ jobs:
           curl -sf -X POST localhost:8090/v1/route -H 'Content-Type: application/json' \
                -d '{"query":"reverse a linked list in python"}' | head -c 300
           python -c "import json;h=json.load(open('health.json'));assert h['spend_usd']==0,h"
+
+      # The browser defences, asserted rather than assumed. Both failures are silent: a
+      # reflected Origin looks fine until a random web page is spending your credit, and a
+      # missing Host check looks fine until DNS rebinding walks straight past same-origin.
+      - name: Browsers are locked out by default
+        run: |
+          python -m fugal --serve --port 8091 &
+          for i in $(seq 1 60); do
+            curl -sf localhost:8091/health >/dev/null && break || sleep 2
+          done
+
+          echo "-- no Access-Control-Allow-Origin is reflected"
+          if curl -si localhost:8091/health -H 'Origin: https://evil.example' \
+               | grep -i 'access-control-allow-origin'; then
+            echo "::error::CORS header sent to an origin that was never allowed"; exit 1
+          fi
+
+          echo "-- preflight from an unlisted origin is refused"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS \
+                 localhost:8091/v1/chat/completions -H 'Origin: https://evil.example')
+          [ "$code" = "403" ] || { echo "::error::preflight returned $code, want 403"; exit 1; }
+
+          echo "-- a rebound Host is refused"
+          code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8091/health \
+                 -H 'Host: evil.example')
+          [ "$code" = "403" ] || { echo "::error::rebound Host returned $code, want 403"; exit 1; }
+
+          echo "-- localhost still works"
+          curl -sf localhost:8091/health >/dev/null
+
+          echo "-- an explicitly allowed origin IS honoured"
+          kill %1 || true
+          python -m fugal --serve --port 8092 --cors-origin https://good.example &
+          for i in $(seq 1 60); do
+            curl -sf localhost:8092/health >/dev/null && break || sleep 2
+          done
+          curl -si localhost:8092/health -H 'Origin: https://good.example' \
+            | grep -i 'access-control-allow-origin: https://good.example'

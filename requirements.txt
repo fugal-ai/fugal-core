@@ -1,7 +1,9 @@
 # The router: one local forward pass of Qwen3-0.6B. No generation, CPU is fine.
 torch>=2.4
-transformers>=4.52,<5
-numpy
+# No upper bound: FugalRouter handles both the <5 `torch_dtype=` and the >=5 `dtype=`
+# spelling. The cap used to say <5 while the code already supported 5 — pick one.
+transformers>=4.52
+numpy>=1.24
 # Worker calls (OpenRouter) — only used when you actually answer a question.
 requests
 # One-time backbone download: scripts/fetch_backbone.py

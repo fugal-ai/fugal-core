@@ -20,6 +20,22 @@ needs evidence for that model. See docs/HEAD_FORMAT.md.
 
 Serving (OpenAI + Anthropic wire shapes), the CLI, and the spend controls live in
 serve.py. This file is the model.
+
+PROVENANCE (Apache-2.0 s4(b) — this file contains modified third-party material).
+The hidden-state extraction path below — ROUTER_SYSTEM_PROMPT, HIDDEN_POS,
+FugalRouter.format_transcript and FugalRouter.hidden — is DERIVED FROM
+`openfugu/mini.py` in github.com/trotsky1997/OpenFugu, Copyright 2026 The OpenFugu
+Contributors, Apache-2.0. Fugal's changes to it: the SVF backbone adaptation was
+removed (this runs an unmodified Qwen3-0.6B, no TRINITY checkpoint), the bias-free
+(10, 1024) agent/role logit head was replaced by the (17, 1024) per-model logistic
+head with bias and the price-discounted decision rule, the hidden state is now
+L2-normalised, and the multi-turn Coordinator loop was not carried over. See NOTICE.
+
+The `[EXEC]` tags on two constants below are OpenFugu's provenance notation, kept so
+the constants stay traceable to where they were established: [EXEC] means the value
+was reproduced by running real weights rather than read off a paper. Fugal inherited
+these values; see the caveat in docs/HEAD_FORMAT.md about what that does and does not
+justify.
 """
 from __future__ import annotations
 import json, os, random, threading, time
@@ -37,13 +53,13 @@ os.environ.setdefault("FUGAL_MODEL", os.path.join(REPO, "artifacts", "Qwen3-0.6B
 HEAD = os.environ.get("FUGAL_HEAD") or os.path.join(REPO, "data", "router_head.npz")
 PRICES = os.environ.get("FUGAL_PRICES") or os.path.join(REPO, "data", "models_2026-06.json")
 
-HIDDEN_POS = -2            # penultimate-token hidden state [EXEC]
+HIDDEN_POS = -2            # penultimate-token hidden state [EXEC, from OpenFugu]
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# The router conditions on this exact system prompt plus the question. It is verbatim from
-# the TRINITY coordinator this router's design derives from (see NOTICE), and the head was
-# fit on hidden states produced under it — so the string is part of the trained artifact,
-# not a stylistic choice. `num_agents=7` is likewise fixed by what the head was fit under;
+# The router conditions on this exact system prompt plus the question. It is byte-identical
+# to ROUTER_SYSTEM_PROMPT in OpenFugu's openfugu/mini.py, which reconstructed it from the
+# TRINITY coordinator (see NOTICE), and Fugal's head was fit on hidden states produced under
+# it — so the string is part of the trained artifact, not a stylistic choice. `num_agents=7` is likewise fixed by what the head was fit under;
 # it does NOT mean "we route among 7 models" (we route among 17). Changing either invalidates
 # the head.
 ROUTER_SYSTEM_PROMPT = (
@@ -120,7 +136,9 @@ class FugalRouter:
 
     @staticmethod
     def format_transcript(messages: list[dict]) -> str:
-        # raw 'role: content', NOT a chat template — proven decisive (95% vs 11%). [EXEC]
+        # raw 'role: content', NOT a chat template. [EXEC, from OpenFugu] — the 95%-vs-11%
+        # figure is OpenFugu's measurement against the TRINITY checkpoint, not Fugal's.
+        # Fugal keeps the format because its own head was fit under it.
         return "\n".join(f'{m["role"]}: {m["content"]}' for m in messages)
 
     def hidden(self, messages: list[dict]):

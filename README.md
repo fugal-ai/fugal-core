@@ -1,5 +1,9 @@
 # Fugal
 
+[![CI](https://github.com/jtdoherty/fugal-core/actions/workflows/ci.yml/badge.svg)](https://github.com/jtdoherty/fugal-core/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 **One forward pass picks the model. Then it calls that one model, once.**
 
 A 0.6B model reads your question and predicts, for each of 17 frontier models, the probability
@@ -22,7 +26,7 @@ Each row is an independent logistic head for one model. It is the only novel art
 No API key, no account, nothing to sign up for. The router runs locally.
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt             # or: pip install -e .   (adds a `fugal` command)
 python scripts/fetch_backbone.py            # one-time: Qwen3-0.6B (~1.5 GB) -> artifacts/
 python -m fugal --route "what is 15% of 240?"
 ```
@@ -70,7 +74,10 @@ $ python -m fugal --models "openai/gpt-5.4-nano,deepseek/deepseek-v4-flash,meta-
 `FUGAL_MODELS="a,b,c"` does the same thing as an environment variable, including for the
 server. **Subsetting is exact, not an approximation**: each row of `W` is an independent
 logistic head, so dropping rows cannot disturb the ones that remain — the scores above are
-identical to those models' scores in the full table.
+the same ones those models get in the full table, and the ranking among them is unchanged.
+(`verify/verify_head.py` asserts both over random subsets. Scores can differ in the last
+bit — BLAS blocks a 17-row matrix-vector product differently from a 3-row one — which is
+floating-point arithmetic, not the models interacting.)
 
 The reverse does not hold. You cannot add a model the head was never fit on; a `p_solve` row
 has to be measured, not invented. `docs/HEAD_FORMAT.md` gives the `.npz` contract and says
@@ -99,8 +106,15 @@ needs no key. Claude Code and OpenClaw both work against it today —
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) has the exact configuration, and an honest list of
 what does not work.
 
-**Always pass `--spend-cap`.** It is a hard cumulative USD ceiling; past it the server returns
-402 instead of spending.
+**Always pass `--spend-cap`.** It is a cumulative USD ceiling; past it the server returns
+402 instead of spending. It is checked before each call, so concurrent requests can overshoot
+slightly, and it resets on restart — a brake, not an accounting record. Set a hard limit on
+the OpenRouter key too; that is the only one that survives a bug in this code.
+
+Browsers are locked out by default: no CORS headers unless you name an origin with
+`--cors-origin`, and on a loopback bind the `Host` header must name loopback. Otherwise any
+page you happened to be visiting could spend your credit from your own machine. See
+[`SECURITY.md`](SECURITY.md).
 
 ## Layout
 
@@ -111,7 +125,20 @@ data/router_head.npz        the trained head: W, b, models, mean_cost, lam  (73 
 data/models_2026-06.json    price sheet, USD per million tokens
 docs/HEAD_FORMAT.md         the .npz contract, and the limits of subsetting
 docs/INTEGRATION.md         wiring Fugal into Claude Code / OpenClaw / SDKs
+docs/EVALUATION.md          how to check the head is any good, and what that needs
 verify/verify_routing.py    the core promise: exactly one model call per turn
+verify/verify_head.py       head properties, pure numpy, no backbone, <1s
+verify/verify_calibration.py  is p_solve true? (needs a graded fixture — see EVALUATION.md)
+tests/test_adapters.py      the OpenAI/Anthropic wire-shape conversions
+scripts/refresh_prices.py   re-sync the price sheet with OpenRouter
+```
+
+Everything above except the head and the price sheet is checkable on a fresh clone:
+
+```bash
+python -m unittest discover -s tests    # milliseconds, no backbone, no network
+python verify/verify_head.py            # <1s, no backbone, no network
+python verify/verify_routing.py         # needs the backbone; mocked worker, $0
 ```
 
 Two knobs worth knowing. `--router-lambda` overrides the head's cost sensitivity (shipped:
@@ -122,11 +149,27 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
 
 - The head was fit on **standalone questions**. On a follow-up turn ("now in Rust") the routing
   signal is weaker than on a fresh question, and the router reads only the latest message.
-- The 17 model ids and the price sheet are a **2026-06 snapshot**. Prices move; `mean_cost` is
-  a fixed measurement, not a live feed.
+- The 17 model ids are a **2026-06 snapshot**, and two different numbers here are made of
+  prices. `mean_cost` inside the head is *routing* input: a measurement taken when the head
+  was fit, deliberately frozen, because `utility = p - λ·mean_cost` has to be evaluated
+  against the costs the head was fit under. `data/models_2026-06.json` is *billing* input:
+  it is what `meta.cost`, `X-Fugal-Cost-USD` and the spend caps are computed from, so it
+  should be current. Run `python scripts/refresh_prices.py` (or `--check`) to keep it that
+  way; a stale sheet means your cap is counting the wrong dollars.
+- **`HIDDEN_POS = -2`, the router prompt and `num_agents=7` are inherited, not re-derived.**
+  They were established by OpenFugu against the TRINITY checkpoint, which adapts the
+  backbone with SVF and uses a 10-row logit head — neither of which Fugal does. They are
+  still correct *here*, because this head was fit under them, but nothing in this repo shows
+  `-2` beats `-1` or mean-pooling for this head. Treat them as fixed, not as optimised.
 - The evidence behind the head — the model×question matrix it was fit on, the end-to-end
   benchmarks, the dated reports — lives in a separate research repository that is **not
-  public**. This repo ships the artifact and the code that runs it, not the study.
+  public**. This repo ships the artifact and the code that runs it, not the study. So
+  nothing here proves `p_solve` is *calibrated*, only that it is well-formed
+  (`verify/verify_head.py`) and that exactly one model is called
+  (`verify/verify_routing.py`). [`docs/EVALUATION.md`](docs/EVALUATION.md) specifies a
+  held-out fixture format; hand one to `verify/verify_calibration.py` and it will report
+  AUC, calibration error, and routed accuracy-and-cost against a hindsight-chosen best
+  fixed model, a cheapest-always baseline, and a per-question oracle.
 - `ROUTER_SYSTEM_PROMPT` and `num_agents=7` in `router.py` are **part of the trained artifact**,
   not style. The head was fit on hidden states produced under that exact string; `7` is not the
   number of models (there are 17). Changing either silently invalidates the head.

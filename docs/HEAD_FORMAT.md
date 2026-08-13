@@ -49,9 +49,17 @@ python -m fugal --models "openai/gpt-5.5,deepseek/deepseek-v4-pro" --route "..."
 FUGAL_MODELS="openai/gpt-5.5,deepseek/deepseek-v4-pro" python -m fugal --serve
 ```
 
-The `p_solve` printed for a model in a two-model pool is bit-identical to its `p_solve` in the
-full seventeen. Use this when you hold keys for some providers and not others. Fugal validates
-the list against `models` and refuses unknown ids rather than silently ignoring them.
+The `p_solve` printed for a model in a two-model pool is the same one it gets in the full
+seventeen, and the ranking among the survivors is unchanged. Use this when you hold keys for
+some providers and not others. Fugal validates the list against `models` and refuses unknown
+ids rather than silently ignoring them.
+
+One caveat, so nobody is surprised by it: the two scores can differ in the final bit
+(~1e-16). BLAS picks a different blocking for a `(17, 1024)` matrix-vector product than for a
+`(2, 1024)` one, so the same dot product accumulates in a different order. That is arithmetic,
+not the models influencing each other — it is thirteen orders of magnitude below the smallest
+utility gap in the shipped head, and `verify/verify_head.py` asserts both the bound and the
+rank stability over 200 random subsets.
 
 ## Adding a model is a different thing entirely
 
@@ -84,3 +92,21 @@ crashes — the router just routes worse, which is the worst failure mode availa
 message, formatted as raw `role: content` lines rather than a chat template. All of that was
 fixed when the head was fit. `num_agents=7` does not mean "7 models" — there are 17. Editing
 either constant in `router.py` invalidates the head without any visible error.
+
+## Where the constants came from, and what that does not prove
+
+`HIDDEN_POS = -2`, the router prompt string, `num_agents=7` and the raw `role: content`
+transcript format all come from OpenFugu's reconstruction of the TRINITY coordinator (see
+`NOTICE`), where they were established against the released TRINITY checkpoint — which
+adapts the backbone with SVF and reads a bias-free 10-row agent/role logit head.
+
+**Fugal does neither.** It runs an unmodified Qwen3-0.6B and a 17-row logistic head. So the
+reason to keep these constants is not that they were shown optimal for this setup — it is
+the narrower and sufficient one that *this head was fit under them*, so changing them puts
+the head and its conditioning out of step. Nothing in this repo demonstrates that `-2` beats
+`-1` or mean-pooling, or that this prompt beats a different one, for a head fit without SVF.
+Establishing that would mean refitting under each variant and comparing on held-out graded
+outcomes — see `docs/EVALUATION.md`.
+
+Stated plainly because the distinction matters if you fit your own head: these are fixed
+constants, not tuned ones.

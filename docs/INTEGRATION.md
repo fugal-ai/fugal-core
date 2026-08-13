@@ -44,6 +44,25 @@ With a token set, tokenless requests are refused with 401 — unless you also pa
 which opens an anonymous public tier bounded by that shared per-UTC-day budget and the per-IP
 `--rate-limit`. `/v1/route` stays free and open either way.
 
+### Browsers
+
+Two defaults exist because "no auth on localhost with a live key" is the documented setup, and
+that is exactly what a hostile web page can reach:
+
+- **No CORS headers are sent** unless you allow an origin: `--cors-origin https://your.app`
+  (repeatable, or `FUGAL_CORS_ORIGINS=a,b`). Without this the browser refuses to hand the
+  response to the page, so a drive-by `fetch()` cannot read your answers — or spend your
+  credit getting them. A preflight from an unlisted origin gets a 403 rather than a silent
+  failure, so a legitimate web app finds out what to configure.
+- **The `Host` header must name loopback** when bound to loopback. This is the DNS-rebinding
+  defence: a page on `evil.example` whose DNS answer is `127.0.0.1` satisfies same-origin
+  policy and CORS never enters into it, but it still arrives with `Host: evil.example`. Add
+  legitimate names with `--allow-host`. The check is off for non-loopback binds, where a
+  reverse proxy is forwarding a real public hostname.
+
+Neither applies to a CLI, an SDK, or a terminal agent — `curl`, the OpenAI SDK, Claude Code
+and OpenClaw all work unchanged.
+
 Check it came up the way you expect:
 
 ```bash
@@ -196,6 +215,11 @@ remember that the outermost spend brake is the hard limit on the OpenRouter key 
 - **Routing reads the last message only.** The head was fit on standalone questions, so on
   a follow-up (or a tool-result turn) the routing signal is weaker than on a fresh question.
 - **`temperature` is fixed at 0.0** and the caller's value is ignored.
+- **Reported cost is only as good as the price sheet.** `X-Fugal-Cost-USD`, the `fugal.cost`
+  field and the spend caps are all computed from `data/models_2026-06.json`. Providers move
+  their prices; `python scripts/refresh_prices.py` re-syncs it, and `--check` reports drift
+  without writing. The `mean_cost` used for *routing* is frozen with the head on purpose and
+  is not touched.
 - **Cost barely influences routing.** The shipped head is **λ=2.0**, and the accuracy spread
   across the 17 models is wide enough that price acts as a tiebreaker rather than a driver:
   `"hi"` routes to `anthropic/claude-sonnet-5`, and still does at `--router-lambda 10`. Where

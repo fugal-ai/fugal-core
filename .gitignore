@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 .venv*/
+# packaging output from `pip install -e .` / a wheel build
+*.egg-info/
+build/
+dist/
 # third-party material fetched by scripts/fetch_backbone.py — never redistributed (see NOTICE)
 artifacts/
 # ...and as a SYMLINK, which `artifacts/` (trailing slash) does not match.
@@ -8,5 +12,9 @@ artifacts/
 *.safetensors
 *.npy
 .env
+# your own graded evaluation fixture and its hidden-state cache (docs/EVALUATION.md).
+# data/eval_fixture.example.jsonl is tracked; a real one is yours to publish or not.
+data/eval_fixture.jsonl
+*.hidden.npz
 # local rollback copies (e.g. serve.py.bak-trim) — git history is the real backup
 *.bak-*
