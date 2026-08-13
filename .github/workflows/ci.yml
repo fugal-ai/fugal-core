@@ -82,7 +82,7 @@ jobs:
           python-version: "3.12"
 
       - name: Cache the backbone
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: artifacts/Qwen3-0.6B
           key: qwen3-0.6b-${{ hashFiles('scripts/fetch_backbone.py') }}
