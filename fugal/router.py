@@ -171,7 +171,7 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
             r.raise_for_status()
             j = r.json()
             if "choices" not in j:
-                raise RuntimeError(str(j.get("error", j))[:200])
+                raise ValueError(str(j.get("error", j))[:200])
             msg = j["choices"][0]["message"] or {}
             u = j.get("usage", {}) or {}
             return msg, int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0))
@@ -179,6 +179,8 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
             last = e
         except RuntimeError as e:
             last = e
+        except ValueError:
+            raise
         if attempt < retries - 1:
             time.sleep((2 ** attempt) + random.random())
     raise last if last else RuntimeError("or_request failed")
@@ -238,8 +240,12 @@ class Fugal:
         self.models = [all_models[i] for i in idx]
         self.W, self.b, self.mean_cost = z["W"][idx], z["b"][idx], z["mean_cost"][idx]
         self.lam = float(z["lam"]) if router_lambda is None else float(router_lambda)
-        self.prices = {m["id"]: (m["in"] / 1e6, m["out"] / 1e6)
-                       for m in json.load(open(PRICES))}
+        with open(PRICES) as f:
+            self.prices = {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in json.load(f)}
+        unpriced = [m for m in self.models if m not in self.prices]
+        if unpriced:
+            import warnings
+            warnings.warn(f"no price for {unpriced}; cost reporting will be wrong")
         mdir = os.environ["FUGAL_MODEL"]
         if not os.path.isdir(mdir):
             raise SystemExit(

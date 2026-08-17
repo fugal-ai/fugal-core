@@ -8,8 +8,8 @@ Usage:
   python -m fugal --route "what is 15% of 240?"       # one-shot, same table ($0)
   python -m fugal --query "..."                       # route once, answer once (spends credit)
   python -m fugal --serve --port 8090 --spend-cap 5.00
-      # OpenAI + Anthropic compatible endpoint. Threaded; optional bearer auth via
-      # FUGAL_SERVE_TOKEN; --spend-cap is a hard cumulative USD ceiling.
+      # OpenAI + Anthropic compatible endpoint with real streaming. Optional bearer auth
+      # via FUGAL_SERVE_TOKEN; --spend-cap is a hard cumulative USD ceiling.
       # GET /health, GET /v1/models, POST /v1/route ($0, no key), POST /v1/chat/completions,
       # POST /v1/messages.
       # Browsers are locked out by default: no CORS headers unless --cors-origin says so,
@@ -21,10 +21,11 @@ useful when you hold keys for some providers and not others. See docs/HEAD_FORMA
 Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone directory).
 """
 from __future__ import annotations
-import argparse, hmac, json, os, sys, threading, time, uuid
+import argparse, asyncio, hmac, json, os, sys, time, uuid
 
 from ._console import use_utf8
-from .router import Fugal, clamp_max_tokens, compose_system, or_request, or_call  # noqa: F401
+from .router import (Fugal, clamp_max_tokens, compose_system,                    # noqa: F401
+                     or_request, or_call, OR_URL)
 
 
 def client_system_from_body(body):
@@ -216,11 +217,14 @@ def route_repl(models=None, router_lambda=None):
     print("bye")
 
 
-# ---- the server --------------------------------------------------------------
+# ---- the async server --------------------------------------------------------
 def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
           router_lambda=None, models=None, cors_origins=None, allow_hosts=None):
-    """OpenAI- and Anthropic-compatible endpoint. Threaded, optional bearer auth
-    (FUGAL_SERVE_TOKEN), a hard cumulative spend cap, and /health + /v1/models.
+    """OpenAI- and Anthropic-compatible async endpoint with real streaming.
+
+    Backed by Starlette + uvicorn. Real SSE streaming from OpenRouter via httpx so
+    clients see tokens as they arrive. Routing (the torch forward pass) runs in a
+    thread pool so it never blocks the event loop.
 
     Every request is routed to ONE model and that model's answer is returned, once —
     streaming, tool calling and multi-turn included.
@@ -232,52 +236,52 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
       - With the FUGAL_SERVE_TOKEN bearer — bypasses the daily cap and rate limit
         (still bounded by the cumulative --spend-cap safety net).
 
-    Browser defences, both ON by default because the documented way to run this is
-    `--serve` on localhost with NO token and a live OpenRouter key:
-      - No CORS headers are sent unless an origin is explicitly allowed
-        (`cors_origins` / --cors-origin / FUGAL_CORS_ORIGINS). Reflecting whatever
-        Origin arrived would let any page the user happens to visit spend their
-        credit from the browser and read the answer back.
-      - When bound to loopback, the Host header must name loopback (or something
-        passed to `allow_hosts`). That is what stops DNS rebinding: an attacker
-        resolving evil.example to 127.0.0.1 arrives with Host: evil.example."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    Browser defences, both ON by default:
+      - No CORS headers unless an origin is explicitly allowed.
+      - When bound to loopback, the Host header must name loopback."""
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response, StreamingResponse
+    from starlette.routing import Route
     from collections import deque
     from datetime import datetime, timezone
+    import httpx
+
     f2 = Fugal(models=models, router_lambda=router_lambda)
-    token = os.environ.get("FUGAL_SERVE_TOKEN")          # None => no auth (localhost)
+    token = os.environ.get("FUGAL_SERVE_TOKEN")
     cors = set(cors_origins or [])
-    # Host checking applies only to a loopback bind. Bound to 0.0.0.0 the server is
-    # behind a reverse proxy (docs/INTEGRATION.md), which forwards the public hostname — there
-    # is no rebinding to defend against and a fixed allowlist would just reject traffic.
     loopback_bind = host in ("127.0.0.1", "localhost", "::1")
     hosts_ok = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in (allow_hosts or [])}
     meter = {"spent": 0.0, "n": 0, "day": None, "day_spent": 0.0}
-    mlock = threading.Lock()
-    hits = {}                                            # ip -> deque[timestamps]
-    hlock = threading.Lock()
+    meter_lock = asyncio.Lock()
+    hits: dict[str, deque] = {}
+    hits_lock = asyncio.Lock()
     MAX_BODY = 256 * 1024
-    ROUTES = ("/v1/chat/completions", "/chat/completions")
-    # Anthropic Messages shape. Same router and same caps — only the request and response
-    # envelopes differ. Claude Code speaks this and NOT the OpenAI shape, which is why one
-    # endpoint was never enough.
-    ANTHROPIC_ROUTES = ("/v1/messages", "/messages")
 
     def utc_day():
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def day_spent():                                    # call under mlock
+    def _day_spent():
         d = utc_day()
         if meter["day"] != d:
             meter["day"], meter["day_spent"] = d, 0.0
         return meter["day_spent"]
 
-    def rate_limited(ip, limit=rate_limit, window=60.0):
-        """Sliding-window per-IP limiter. Returns True when over the limit."""
+    async def add_spend(cost, public):
+        async with meter_lock:
+            meter["spent"] += cost
+            meter["n"] += 1
+            if public:
+                _day_spent()
+                meter["day_spent"] += cost
+
+    async def rate_limited(ip, limit=rate_limit, window=60.0):
         now = time.time()
-        with hlock:
-            if len(hits) > 10000:                       # bound memory under IP churn
-                hits.clear()
+        async with hits_lock:
+            if len(hits) > 10000:
+                stale = [k for k, dq in hits.items() if not dq or now - dq[-1] > window]
+                for k in stale:
+                    del hits[k]
             dq = hits.setdefault(ip, deque())
             while dq and now - dq[0] > window:
                 dq.popleft()
@@ -286,426 +290,560 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             dq.append(now)
         return False
 
-    def add_spend(cost, public):
-        with mlock:
-            meter["spent"] += cost
-            meter["n"] += 1
-            if public:
-                day_spent()                             # rolls the day if needed
-                meter["day_spent"] += cost
+    def cors_headers(request):
+        origin = request.headers.get("origin")
+        if not origin or not cors:
+            return {}
+        if "*" in cors:
+            return {"access-control-allow-origin": "*"}
+        if origin in cors:
+            return {"access-control-allow-origin": origin, "vary": "Origin"}
+        return {}
 
-    class H(BaseHTTPRequestHandler):
-        def _json(self, code, obj, extra_headers=()):
-            data = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Connection", "close")
-            for k, v in self._cors():
-                self.send_header(k, v)
-            for k, v in extra_headers:
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(data)
+    def _json(code, obj, request, extra_headers=None):
+        hdrs = {"connection": "close"}
+        if extra_headers:
+            hdrs.update(extra_headers)
+        return JSONResponse(obj, status_code=code, headers=hdrs)
 
-        def _cors(self):
-            """CORS headers — ONLY for an origin that was explicitly allowed.
+    def _err(code, msg, request, typ="invalid_request_error"):
+        return _json(code, {"error": {"message": msg, "type": typ}}, request)
 
-            Returning nothing is the safe default: without Access-Control-Allow-Origin
-            the browser refuses to hand the response back to the page, so a drive-by
-            fetch from an unrelated site cannot read answers (or preflight its way to
-            sending an Authorization header). Pass --cors-origin to opt a real web app
-            in; '*' is accepted but means any page on the internet."""
-            origin = self.headers.get("Origin")
-            if not origin or not cors:
-                return []
-            if "*" in cors:
-                return [("Access-Control-Allow-Origin", "*")]
-            if origin in cors:
-                return [("Access-Control-Allow-Origin", origin), ("Vary", "Origin")]
-            return []
+    def auth_value(request):
+        h = request.headers.get("authorization", "")
+        if h.startswith("Bearer "):
+            return h[7:].strip()
+        return (request.headers.get("x-api-key") or "").strip()
 
-        def _host_ok(self):
-            """Host header names this machine (loopback binds only) — anti-DNS-rebinding.
+    def authed(request):
+        if not token:
+            return True
+        return hmac.compare_digest(auth_value(request), token)
 
-            A page on evil.example whose DNS answer is 127.0.0.1 reaches this server with
-            the browser's same-origin policy satisfied; CORS never enters into it. The
-            Host header is the one field that still carries the attacker's name."""
-            if not loopback_bind:
-                return True
-            h = (self.headers.get("Host") or "").strip().lower()
-            if not h:
-                return False
-            if h.startswith("["):                       # [::1]:8090
-                name = h[1:h.find("]")] if "]" in h else h
-            else:                                       # host:port, or a bare IPv6 literal
-                name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
-            return name in hosts_ok
+    def client_ip(request):
+        peer = request.client.host if request.client else "127.0.0.1"
+        if peer in ("127.0.0.1", "::1"):
+            xff = request.headers.get("x-forwarded-for")
+            if xff:
+                return xff.split(",")[0].strip()
+        return peer
 
-        def _guard(self):
-            """True if the request may proceed; otherwise the 403 has already been sent."""
-            if self._host_ok():
-                return True
-            self._err(403, "Host header not allowed; reach this server as localhost, "
-                           "or pass --allow-host", "permission_error")
-            return False
+    async def capped():
+        async with meter_lock:
+            return spend_cap is not None and meter["spent"] >= spend_cap
 
-        def _err(self, code, msg, typ="invalid_request_error"):
-            self._json(code, {"error": {"message": msg, "type": typ}})
+    def read_body(raw, anthropic=False):
+        if anthropic:
+            body = anthropic_to_body(raw)
+            body["stream"] = bool(raw.get("stream"))
+            body["max_tokens"] = raw.get("max_tokens")
+            if raw.get("tools"):
+                body["tools"] = anthropic_tools_to_openai(raw.get("tools"))
+        else:
+            body = raw
+        if "messages" in body:
+            q = body["messages"][-1]["content"]
+        else:
+            q = body["query"]
+        if not isinstance(q, str) or not q.strip():
+            raise ValueError("query must be a non-empty string")
+        return q, body
 
-        def _auth_value(self):
-            """The caller's credential, from whichever header their client uses.
-            Anthropic SDKs and Claude Code send `x-api-key`; OpenAI-shaped clients send
-            `Authorization: Bearer`. Accepting both is what lets one token work everywhere."""
-            h = self.headers.get("Authorization", "")
-            if h.startswith("Bearer "):
-                return h[7:].strip()
-            return (self.headers.get("x-api-key") or "").strip()
+    def _build_or_messages(q, hist, tools, msgs, sys_prompt):
+        if tools:
+            base = msgs if msgs is not None else (
+                list(hist or []) + [{"role": "user", "content": q}])
+            return [{"role": "system", "content": sys_prompt}] \
+                + [m for m in base if m.get("role") != "system"]
+        return ([{"role": "system", "content": sys_prompt}]
+                + list(hist or [])
+                + [{"role": "user", "content": q}])
 
-        def _authed(self):
-            # compare_digest, not ==, so a network attacker cannot walk the token out
-            # one byte at a time off response timing — this token is the only thing between
-            # a reachable port and a live OpenRouter key.
-            if not token:
-                return True
-            return hmac.compare_digest(self._auth_value(), token)
+    # ---- route handlers ----------------------------------------------------------
 
-        def _client_ip(self):
-            # trust X-Forwarded-For only when the peer is the local reverse proxy
-            peer = self.client_address[0]
-            if peer in ("127.0.0.1", "::1"):
-                xff = self.headers.get("X-Forwarded-For")
-                if xff:
-                    return xff.split(",")[0].strip()
-            return peer
+    async def health(request):
+        async with meter_lock:
+            ds = _day_spent()
+            m = dict(meter)
+        return _json(200, {"status": "ok", "queries": m["n"],
+                           "spend_usd": round(m["spent"], 5),
+                           "spend_cap_usd": spend_cap,
+                           "daily_cap_usd": daily_cap,
+                           "day_spent_usd": round(ds, 5)}, request)
 
-        def _capped(self):
-            with mlock:
-                return spend_cap is not None and meter["spent"] >= spend_cap
+    async def models_list(request):
+        return _json(200, {"object": "list", "data": [
+            {"id": "fugal/auto", "object": "model", "owned_by": "fugal",
+             "description": "Routes each request to the model with the best "
+                            "odds-vs-price trade for that question."}]}, request)
 
-        def do_OPTIONS(self):
-            if not self._guard():
-                return
-            hdrs = self._cors()
-            if self.headers.get("Origin") and not hdrs:
-                # Fail the preflight explicitly rather than 204-ing without the header:
-                # the browser blocks the real request either way, but a 403 tells whoever
-                # is configuring a legitimate web app that --cors-origin is what they want.
-                return self._err(403, "origin not allowed; start the server with "
-                                      "--cors-origin https://your.app", "permission_error")
-            self.send_response(204)
-            for k, v in hdrs:
-                self.send_header(k, v)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers",
-                             "Authorization, Content-Type, x-api-key, anthropic-version")
-            self.send_header("Connection", "close")
-            self.end_headers()
+    async def route_only(request):
+        if await rate_limited("r|" + client_ip(request), limit=max(rate_limit * 2, 12)):
+            return _err(429, "rate limit exceeded; try again in a minute",
+                        request, "rate_limit_error")
+        try:
+            raw = await request.json()
+        except Exception:
+            return _err(400, "body must be valid JSON", request)
+        try:
+            q, _ = read_body(raw)
+        except Exception:
+            return _err(400, "body must be JSON with messages[].content or a query field",
+                        request)
+        if len(q) > 8000:
+            return _err(400, "query too long for the router (8000 chars max)", request)
+        ranked, probs = await asyncio.to_thread(f2.route, q)
+        mc = {m: float(c) for m, c in zip(f2.models, f2.mean_cost)}
+        return _json(200, {
+            "object": "fugal.route",
+            "worker": ranked[0], "p_solve": round(float(probs[0]), 4),
+            "lambda": f2.lam,
+            "ranked": [{"model": m, "p_solve": round(float(p), 4),
+                        "est_cost_usd": round(mc[m], 6),
+                        "utility": round(float(p) - f2.lam * mc[m], 4)}
+                       for m, p in zip(ranked, probs)]}, request)
 
-        def do_GET(self):
-            if not self._guard():
-                return
-            path = self.path.rstrip("/") or "/"
-            if path == "/health":
-                with mlock:
-                    ds = day_spent()
-                    m = dict(meter)
-                return self._json(200, {"status": "ok", "queries": m["n"],
-                                        "spend_usd": round(m["spent"], 5),
-                                        "spend_cap_usd": spend_cap,
-                                        "daily_cap_usd": daily_cap,
-                                        "day_spent_usd": round(ds, 5)})
-            if path == "/v1/models":
-                # "fugal/auto" IS the product — one id meaning "you pick nothing, we route".
-                return self._json(200, {"object": "list", "data": [
-                    {"id": "fugal/auto", "object": "model", "owned_by": "fugal",
-                     "description": "Routes each request to the model with the best "
-                                    "odds-vs-price trade for that question."}]})
-            return self._err(404, "not found", "not_found_error")
+    async def _do_completions(request, anthropic=False):
+        """Shared handler for OpenAI and Anthropic wire shapes."""
+        public = not authed(request)
+        req_id = "req_" + uuid.uuid4().hex[:20]
+        if public:
+            if daily_cap is None:
+                return _err(401, "missing or invalid bearer token",
+                            request, "authentication_error")
+            if await rate_limited("c|" + client_ip(request)):
+                return _err(429, "rate limit exceeded; try again in a minute",
+                            request, "rate_limit_error")
+            async with meter_lock:
+                exhausted = _day_spent() >= daily_cap
+            if exhausted:
+                return _err(402, "the daily budget is used up — resets at midnight UTC; "
+                                 "route-only mode (POST /v1/route) stays free",
+                            request, "spend_cap_error")
+        n = int(request.headers.get("content-length") or 0)
+        if n <= 0 or n > MAX_BODY:
+            return _err(400, "empty or oversized request body", request)
+        try:
+            raw = await request.json()
+        except Exception:
+            return _err(400, "body must be valid JSON", request)
+        try:
+            q, body = read_body(raw, anthropic=anthropic)
+        except Exception:
+            return _err(400, "body must be JSON with messages[].content or a query field",
+                        request)
+        if public and len(q) > 4000:
+            return _err(400, "query too long for the public tier (4000 chars max)", request)
+        if await capped():
+            return _err(402, f"spend cap ${spend_cap} reached; restart to reset",
+                        request, "spend_cap_error")
 
-        def _read_query(self, anthropic=False):
-            """Parse the request body; returns (query, body) or None (error already sent).
+        hist = (clean_history(body, max_msgs=8, max_chars=8000) if public
+                else clean_history(body))
+        tools = body.get("tools") or None
+        msgs = body.get("messages") if tools else None
+        csys = client_system_from_body(body)
+        mtok = body.get("max_tokens")
 
-            With anthropic=True the Anthropic Messages envelope is normalised first, so
-            everything downstream — history, routing, metering — is shape-agnostic."""
-            n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > MAX_BODY:
-                self._err(400, "empty or oversized request body")
-                return None
+        if body.get("stream"):
+            if anthropic:
+                return StreamingResponse(
+                    _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id),
+                    media_type="text/event-stream",
+                    headers={"cache-control": "no-cache", "connection": "close"})
+            return StreamingResponse(
+                _stream_openai(q, public, hist, tools, msgs, csys, mtok),
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "connection": "close"})
+
+        reply, meta = await asyncio.to_thread(
+            f2.answer, q, history=hist, tools=tools, messages=msgs,
+            system=csys, max_tokens=mtok)
+        await add_spend(meta["cost"], public)
+
+        extra = {"x-fugal-cost-usd": f"{meta['cost']:.6f}"}
+        if anthropic:
+            return _json(200, anthropic_response(req_id, reply, meta), request,
+                         extra_headers=extra)
+        tcalls = meta.get("tool_calls") or []
+        message = {"role": "assistant", "content": reply or None}
+        if tcalls:
+            message["tool_calls"] = tcalls
+        resp = {"id": req_id, "object": "chat.completion",
+                "model": f"fugal/{meta['final_model']}",
+                "choices": [{"index": 0,
+                             "finish_reason": "tool_calls" if tcalls else "stop",
+                             "message": message}],
+                "fugal": meta}
+        result = _json(200, resp, request, extra_headers=extra)
+        print(f"[serve] ok  worker={meta['final_model']}  ${meta['cost']:.5f}  "
+              f"p_solve={meta.get('p_solve', 0):.2f}  "
+              f"hist={len(hist)}  tier={'public' if public else 'full'}", flush=True)
+        return result
+
+    async def chat_completions(request):
+        try:
+            return await _do_completions(request, anthropic=False)
+        except Exception as e:
+            import traceback; traceback.print_exc()
             try:
-                raw = json.loads(self.rfile.read(n))
-                if anthropic:
-                    body = anthropic_to_body(raw)
-                    # `stream` is the one top-level field the shared path still reads; it is
-                    # carried across explicitly rather than by merging the whole raw body,
-                    # so an Anthropic-only field can never reach OpenAI-shaped handling.
-                    body["stream"] = bool(raw.get("stream"))
-                    # max_tokens is REQUIRED on an Anthropic request; carry it across
-                    # explicitly like `stream` so the worker honours the caller's budget.
-                    body["max_tokens"] = raw.get("max_tokens")
-                    # Tools are translated on the way in so only ONE shape exists past
-                    # this point; OpenRouter speaks OpenAI's.
-                    if raw.get("tools"):
-                        body["tools"] = anthropic_tools_to_openai(raw.get("tools"))
-                else:
-                    body = raw
-                if "messages" in body:
-                    q = body["messages"][-1]["content"]
-                else:
-                    q = body["query"]
-                assert isinstance(q, str) and q.strip()
+                return _err(500, f"internal error: {str(e)[:120]}", request, "server_error")
             except Exception:
-                self._err(400, "body must be JSON with messages[].content or a query field")
-                return None
-            return q, body
+                return Response(status_code=500)
 
-        def _route_only(self):
-            """$0 tier: local router forward pass only, never any API call. No token needed."""
-            if rate_limited("r|" + self._client_ip(), limit=max(rate_limit * 2, 12)):
-                return self._err(429, "rate limit exceeded; try again in a minute",
-                                 "rate_limit_error")
-            parsed = self._read_query()
-            if parsed is None:
+    async def messages(request):
+        try:
+            return await _do_completions(request, anthropic=True)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            try:
+                return _err(500, f"internal error: {str(e)[:120]}", request, "server_error")
+            except Exception:
+                return Response(status_code=500)
+
+    # ---- real streaming ----------------------------------------------------------
+
+    async def _stream_openai(q, public, hist, tools, msgs, csys, mtok):
+        """Real SSE streaming for the OpenAI wire shape via httpx."""
+        ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
+        first = ranked[0]
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
+                "final_model": first, "cost": 0.0, "steps": [],
+                "input_tokens": 0, "output_tokens": 0}
+
+        def sse(obj):
+            return f"data: {json.dumps(obj)}\n\n".encode()
+
+        yield sse({"id": cid, "object": "chat.completion.chunk",
+                   "model": f"fugal/{first}",
+                   "choices": [{"index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "finish_reason": None}],
+                   "fugal": {"stage": "route", "model": first,
+                             "p_solve": float(probs[0])}})
+
+        sys_prompt = compose_system(csys)
+        mtok_val = clamp_max_tokens(mtok)
+        or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
+        key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+        payload = {"model": first, "temperature": 0.0, "max_tokens": mtok_val,
+                   "messages": or_msgs, "stream": True,
+                   "stream_options": {"include_usage": True}}
+        if tools:
+            payload["tools"] = tools
+
+        accumulated_tcalls = {}
+        usage = {}
+
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", OR_URL, json=payload, timeout=180.0,
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"},
+                ) as response:
+                    if response.status_code != 200:
+                        body = (await response.aread()).decode(errors="replace")[:200]
+                        yield sse({"id": cid, "object": "chat.completion.chunk",
+                                   "model": f"fugal/{first}",
+                                   "choices": [{"index": 0,
+                                                "delta": {"content": f"[upstream error {response.status_code}: {body}]"},
+                                                "finish_reason": None}]})
+                        yield sse({"id": cid, "object": "chat.completion.chunk",
+                                   "model": f"fugal/{first}",
+                                   "choices": [{"index": 0, "delta": {},
+                                                "finish_reason": "stop"}]})
+                        yield b"data: [DONE]\n\n"
+                        return
+
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        u = chunk.get("usage")
+                        if u:
+                            usage = u
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        if "content" in delta and delta["content"]:
+                            yield sse({"id": cid, "object": "chat.completion.chunk",
+                                       "model": f"fugal/{first}",
+                                       "choices": [{"index": 0,
+                                                    "delta": {"content": delta["content"]},
+                                                    "finish_reason": None}]})
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tcalls:
+                                    accumulated_tcalls[idx] = {
+                                        "id": tc.get("id", ""), "type": "function",
+                                        "function": {"name": "", "arguments": ""}}
+                                if tc.get("id"):
+                                    accumulated_tcalls[idx]["id"] = tc["id"]
+                                fn = tc.get("function", {})
+                                if fn.get("name"):
+                                    accumulated_tcalls[idx]["function"]["name"] = fn["name"]
+                                if "arguments" in fn:
+                                    accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
+        except Exception as exc:
+            yield sse({"id": cid, "object": "chat.completion.chunk",
+                       "model": f"fugal/{first}",
+                       "choices": [{"index": 0,
+                                    "delta": {"content": f"\n\n[stream error: {str(exc)[:100]}]"},
+                                    "finish_reason": None}]})
+
+        itok = int(usage.get("prompt_tokens", 0))
+        otok = int(usage.get("completion_tokens", 0))
+        cost = f2._price(first, itok, otok)
+        meta["cost"] = cost
+        meta["input_tokens"] = itok
+        meta["output_tokens"] = otok
+        meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+
+        tcalls = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+        if tcalls:
+            meta["tool_calls"] = tcalls
+            yield sse({"id": cid, "object": "chat.completion.chunk",
+                       "model": f"fugal/{first}",
+                       "choices": [{"index": 0, "delta": {"tool_calls": tcalls},
+                                    "finish_reason": None}]})
+
+        yield sse({"id": cid, "object": "chat.completion.chunk",
+                   "model": f"fugal/{first}",
+                   "choices": [{"index": 0, "delta": {},
+                                "finish_reason": "tool_calls" if tcalls else "stop"}],
+                   "fugal": {"meta": meta}})
+        yield b"data: [DONE]\n\n"
+
+        await add_spend(cost, public)
+        print(f"[serve] stream ok  worker={first}  ${cost:.5f}  "
+              f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
+              f"tier={'public' if public else 'full'}", flush=True)
+
+    async def _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id):
+        """Real SSE streaming for the Anthropic Messages wire shape via httpx."""
+        ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
+        first = ranked[0]
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
+                "final_model": first, "cost": 0.0, "steps": [],
+                "input_tokens": 0, "output_tokens": 0}
+
+        lf = chr(10)
+
+        def sse(kind, obj):
+            return ("event: " + kind + lf + "data: " + json.dumps(obj) + lf + lf).encode()
+
+        yield sse("message_start", {"type": "message_start", "message": {
+            "id": mid, "type": "message", "role": "assistant",
+            "model": f"fugal/{first}", "content": [],
+            "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                          "content_block": {"type": "text", "text": ""}})
+
+        sys_prompt = compose_system(csys)
+        mtok_val = clamp_max_tokens(mtok)
+        or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
+        key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+        payload = {"model": first, "temperature": 0.0, "max_tokens": mtok_val,
+                   "messages": or_msgs, "stream": True,
+                   "stream_options": {"include_usage": True}}
+        if tools:
+            payload["tools"] = tools
+
+        yield sse("ping", {"type": "ping", "fugal": {
+            "stage": "route", "model": first, "p_solve": float(probs[0])}})
+
+        accumulated_tcalls = {}
+        usage = {}
+
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", OR_URL, json=payload, timeout=180.0,
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"},
+                ) as response:
+                    if response.status_code != 200:
+                        body = (await response.aread()).decode(errors="replace")[:200]
+                        yield sse("content_block_delta", {
+                            "type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta",
+                                      "text": f"[upstream error {response.status_code}: {body}]"}})
+                    else:
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if not line or not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            u = chunk.get("usage")
+                            if u:
+                                usage = u
+                            choices = chunk.get("choices", [])
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
+                            if "content" in delta and delta["content"]:
+                                yield sse("content_block_delta", {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta",
+                                              "text": delta["content"]}})
+                            if "tool_calls" in delta:
+                                for tc in delta["tool_calls"]:
+                                    idx = tc.get("index", 0)
+                                    if idx not in accumulated_tcalls:
+                                        accumulated_tcalls[idx] = {
+                                            "id": tc.get("id", ""), "type": "function",
+                                            "function": {"name": "", "arguments": ""}}
+                                    if tc.get("id"):
+                                        accumulated_tcalls[idx]["id"] = tc["id"]
+                                    fn = tc.get("function", {})
+                                    if fn.get("name"):
+                                        accumulated_tcalls[idx]["function"]["name"] = fn["name"]
+                                    if "arguments" in fn:
+                                        accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
+        except Exception as exc:
+            yield sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta",
+                          "text": f"\n\n[stream error: {str(exc)[:100]}]"}})
+
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+        itok = int(usage.get("prompt_tokens", 0))
+        otok = int(usage.get("completion_tokens", 0))
+        cost = f2._price(first, itok, otok)
+        meta["cost"] = cost
+        meta["input_tokens"] = itok
+        meta["output_tokens"] = otok
+        meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+
+        tcalls = openai_calls_to_anthropic(
+            [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)])
+        if tcalls:
+            meta["tool_calls"] = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+        for i, blk in enumerate(tcalls, start=1):
+            yield sse("content_block_start", {
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "tool_use", "id": blk["id"],
+                                  "name": blk["name"], "input": {}}})
+            yield sse("content_block_delta", {
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(blk["input"])}})
+            yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
+        yield sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use" if tcalls else "end_turn",
+                      "stop_sequence": None},
+            "usage": {"output_tokens": otok},
+            "fugal": meta})
+        yield sse("message_stop", {"type": "message_stop"})
+
+        await add_spend(cost, public)
+        print(f"[serve] anthropic stream ok  worker={first}  "
+              f"${cost:.5f}  hist={len(hist or [])}  "
+              f"tier={'public' if public else 'full'}", flush=True)
+
+    # ---- CORS/Host middleware (raw ASGI) -----------------------------------------
+
+    def _make_middleware(app):
+        async def middleware(scope, receive, send):
+            if scope["type"] != "http":
+                await app(scope, receive, send)
                 return
-            q, _ = parsed
-            if len(q) > 8000:
-                return self._err(400, "query too long for the router (8000 chars max)")
-            ranked, probs = f2.route(q)
-            mc = {m: float(c) for m, c in zip(f2.models, f2.mean_cost)}
-            return self._json(200, {
-                "object": "fugal.route",
-                "worker": ranked[0], "p_solve": round(float(probs[0]), 4),
-                "lambda": f2.lam,
-                "ranked": [{"model": m, "p_solve": round(float(p), 4),
-                            "est_cost_usd": round(mc[m], 6),
-                            "utility": round(float(p) - f2.lam * mc[m], 4)}
-                           for m, p in zip(ranked, probs)]})
+            request = Request(scope)
 
-        def do_POST(self):
-            try:
-                if not self._guard():
+            # Host check (loopback binds only)
+            if loopback_bind:
+                h = (request.headers.get("host") or "").strip().lower()
+                if h.startswith("["):
+                    name = h[1:h.find("]")] if "]" in h else h
+                elif h:
+                    name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+                else:
+                    name = ""
+                if name not in hosts_ok:
+                    r = JSONResponse(
+                        {"error": {"message": "Host header not allowed; reach this server "
+                                               "as localhost, or pass --allow-host",
+                                   "type": "permission_error"}}, status_code=403)
+                    await r(scope, receive, send)
                     return
-                path = self.path.rstrip("/") or "/"
-                if path in ("/v1/route", "/route"):
-                    return self._route_only()
-                anthropic = path in ANTHROPIC_ROUTES
-                if path not in ROUTES and not anthropic:
-                    return self._err(404, "unknown route; use POST /v1/chat/completions, "
-                                          "POST /v1/messages, or POST /v1/route",
-                                     "not_found_error")
-                # tiers: valid token (or no token configured) = full access;
-                # tokenless requests are the PUBLIC tier — only allowed when --daily-cap
-                # is set, and subject to per-IP rate limit + the shared daily budget.
-                public = not self._authed()
-                req_id = "req_" + uuid.uuid4().hex[:20]
-                if public:
-                    if daily_cap is None:
-                        return self._err(401, "missing or invalid bearer token",
-                                         "authentication_error")
-                    if rate_limited("c|" + self._client_ip()):
-                        return self._err(429, "rate limit exceeded; try again in a minute",
-                                         "rate_limit_error")
-                    with mlock:
-                        exhausted = day_spent() >= daily_cap
-                    if exhausted:
-                        return self._err(402, "the daily budget is used up — resets at "
-                                              "midnight UTC; route-only mode (POST /v1/route) "
-                                              "stays free", "spend_cap_error")
-                parsed = self._read_query(anthropic=anthropic)
-                if parsed is None:
+
+            # OPTIONS (CORS preflight)
+            if request.method == "OPTIONS":
+                origin = request.headers.get("origin")
+                c = cors_headers(request)
+                if origin and not c:
+                    r = JSONResponse(
+                        {"error": {"message": "origin not allowed; start the server with "
+                                               "--cors-origin https://your.app",
+                                   "type": "permission_error"}}, status_code=403)
+                    await r(scope, receive, send)
                     return
-                q, body = parsed
-                if public and len(q) > 4000:
-                    return self._err(400, "query too long for the public tier (4000 chars max)")
-                if self._capped():
-                    return self._err(402, f"spend cap ${spend_cap} reached; restart to reset",
-                                     "spend_cap_error")
-                # public tier carries less context — history tokens are billed too
-                hist = (clean_history(body, max_msgs=8, max_chars=8000) if public
-                        else clean_history(body))
-                # With tools present the FULL message list goes through verbatim - the
-                # usual flatten-to-a-query-string destroys tool_call_id linkage, which is
-                # the only thing tying a result back to the call that produced it.
-                tools = body.get("tools") or None
-                msgs = body.get("messages") if tools else None
-                # The caller's system prompt, from whichever field their shape uses. It is
-                # merged after the house prompt at the worker call rather than dropped
-                # (OpenAI shape) or faked as a user turn (Anthropic shape), which is what an
-                # agent harness like Claude Code depends on to behave at all.
-                csys = client_system_from_body(body)
-                mtok = body.get("max_tokens")
+                r = Response(status_code=204, headers={
+                    **c,
+                    "access-control-allow-methods": "GET, POST, OPTIONS",
+                    "access-control-allow-headers":
+                        "Authorization, Content-Type, x-api-key, anthropic-version",
+                    "connection": "close"})
+                await r(scope, receive, send)
+                return
 
-                if body.get("stream"):
-                    if anthropic:
-                        return self._stream_anthropic(q, public, hist, tools, msgs, csys, mtok)
-                    return self._stream(q, public, hist, tools, msgs, csys, mtok)
+            # Inject CORS headers into every response
+            origin = request.headers.get("origin")
+            extra = cors_headers(request)
 
-                reply, meta = f2.answer(q, history=hist, tools=tools, messages=msgs,
-                                        system=csys, max_tokens=mtok)
-                add_spend(meta["cost"], public)
-                if anthropic:
-                    return self._json(200, anthropic_response(req_id, reply, meta),
-                                      extra_headers=[("X-Fugal-Cost-USD",
-                                                      f"{meta['cost']:.6f}")])
-                tcalls = meta.get("tool_calls") or []
-                message = {"role": "assistant", "content": reply or None}
-                if tcalls:
-                    message["tool_calls"] = tcalls
-                resp = {"id": req_id, "object": "chat.completion",
-                        "model": f"fugal/{meta['final_model']}",
-                        "choices": [{"index": 0,
-                                     "finish_reason": "tool_calls" if tcalls else "stop",
-                                     "message": message}],
-                        "fugal": meta}
-                self._json(200, resp, extra_headers=[("X-Fugal-Cost-USD", f"{meta['cost']:.6f}")])
-                print(f"[serve] ok  worker={meta['final_model']}  ${meta['cost']:.5f}  "
-                      f"p_solve={meta.get('p_solve', 0):.2f}  "
-                      f"hist={len(hist)}  tier={'public' if public else 'full'}", flush=True)
-            except BrokenPipeError:
-                pass
-            except Exception as e:
-                import traceback; traceback.print_exc()   # journald: 500s must be debuggable
-                try:
-                    self._err(500, f"internal error: {str(e)[:120]}", "server_error")
-                except Exception:
-                    pass
+            async def send_with_cors(message):
+                if message["type"] == "http.response.start" and extra:
+                    headers = list(message.get("headers", []))
+                    for k, v in extra.items():
+                        headers.append((k.encode(), v.encode()))
+                    message = {**message, "headers": headers}
+                await send(message)
 
-        def _stream(self, q, public=False, history=None, tools=None, messages=None,
-                    system=None, max_tokens=None):
-            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            for k, v in self._cors():
-                self.send_header(k, v)
-            self.end_headers()
+            await app(scope, receive, send_with_cors if extra else send)
 
-            def sse(obj):
-                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
-                self.wfile.flush()
+        return middleware
 
-            def chunk(delta, finish=None, extra=None):
-                o = {"id": cid, "object": "chat.completion.chunk", "model": "fugal/auto",
-                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                if extra:
-                    o["fugal"] = extra
-                sse(o)
+    # ---- build the app -----------------------------------------------------------
 
-            try:
-                chunk({"role": "assistant", "content": ""})
-                final = None
-                for ev in f2.answer_iter(q, history=history, tools=tools, messages=messages,
-                                         system=system, max_tokens=max_tokens):
-                    if ev["stage"] == "final":
-                        final = ev
-                        break
-                    chunk({}, extra={"stage": ev})     # live waterfall event (OpenAI extension)
-                text, meta = final["content"], final["meta"]
-                words = text.split(" ")
-                for i in range(0, len(words), 5):       # stream content in small groups
-                    chunk({"content": (" " if i else "") + " ".join(words[i:i + 5])})
-                tcalls = meta.get("tool_calls") or []
-                if tcalls:
-                    chunk({"tool_calls": tcalls})
-                chunk({}, finish="tool_calls" if tcalls else "stop", extra={"meta": meta})
-                self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
-                add_spend(meta["cost"], public)
-                print(f"[serve] stream ok  worker={meta['final_model']}  ${meta['cost']:.5f}  "
-                      f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(history or [])}  "
-                      f"tier={'public' if public else 'full'}", flush=True)
-            except BrokenPipeError:
-                pass
+    routes = [
+        Route("/health", health, methods=["GET"]),
+        Route("/v1/models", models_list, methods=["GET"]),
+        Route("/v1/route", route_only, methods=["POST"]),
+        Route("/route", route_only, methods=["POST"]),
+        Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+        Route("/chat/completions", chat_completions, methods=["POST"]),
+        Route("/v1/messages", messages, methods=["POST"]),
+        Route("/messages", messages, methods=["POST"]),
+    ]
 
-        def _stream_anthropic(self, q, public=False, history=None, tools=None, messages=None,
-                              system=None, max_tokens=None):
-            """SSE in the Anthropic Messages event vocabulary.
+    inner = Starlette(routes=routes)
 
-            Deliberately NOT a reskin of _stream: the two protocols differ in more than
-            field names. Anthropic sends a named `event:` line alongside each `data:`,
-            wraps text in indexed content blocks that must be opened and closed, carries
-            stop_reason on a message_delta, and has NO [DONE] sentinel - a client that
-            waits for one hangs forever. Getting any of those wrong looks like a working
-            stream right up until the client never terminates."""
-            mid = "msg_" + uuid.uuid4().hex[:24]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            for k, v in self._cors():
-                self.send_header(k, v)
-            self.end_headers()
+    # Wrap with CORS/Host middleware
+    app = _make_middleware(inner)
 
-            def sse(kind, obj):
-                # SSE framing: "event: <name>", "data: <json>", blank line. chr(10) rather
-                # than an escape so the framing survives any codegen that rewrites this file.
-                lf = chr(10)
-                self.wfile.write(("event: " + kind + lf
-                                  + "data: " + json.dumps(obj) + lf + lf).encode())
-                self.wfile.flush()
-
-            try:
-                sse("message_start", {"type": "message_start", "message": {
-                    "id": mid, "type": "message", "role": "assistant",
-                    "model": "fugal/auto", "content": [],
-                    "stop_reason": None, "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}}})
-                sse("content_block_start", {"type": "content_block_start", "index": 0,
-                                            "content_block": {"type": "text", "text": ""}})
-                # Routing happens before any text exists. Anthropic has no event for "still
-                # working", so the waterfall is emitted as ping events, which every client
-                # is required to tolerate and ignore.
-                final = None
-                for ev in f2.answer_iter(q, history=history, tools=tools, messages=messages,
-                                         system=system, max_tokens=max_tokens):
-                    if ev["stage"] == "final":
-                        final = ev
-                        break
-                    sse("ping", {"type": "ping", "fugal": ev})
-                text, meta = final["content"], final["meta"]
-                words = text.split(" ")
-                for i in range(0, len(words), 5):
-                    sse("content_block_delta", {
-                        "type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta",
-                                  "text": (" " if i else "") + " ".join(words[i:i + 5])}})
-                sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-
-                # Tool calls ride as their own indexed content blocks after the text one.
-                # The whole argument object goes in a SINGLE input_json_delta rather than
-                # being chunked: we already have the complete JSON, and emitting partial
-                # fragments we never actually received would be inventing a stream that
-                # did not happen. Clients accumulate either way.
-                tcalls = openai_calls_to_anthropic(meta.get("tool_calls"))
-                for i, blk in enumerate(tcalls, start=1):
-                    sse("content_block_start", {
-                        "type": "content_block_start", "index": i,
-                        "content_block": {"type": "tool_use", "id": blk["id"],
-                                          "name": blk["name"], "input": {}}})
-                    sse("content_block_delta", {
-                        "type": "content_block_delta", "index": i,
-                        "delta": {"type": "input_json_delta",
-                                  "partial_json": json.dumps(blk["input"])}})
-                    sse("content_block_stop", {"type": "content_block_stop", "index": i})
-
-                sse("message_delta", {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "tool_use" if tcalls else "end_turn",
-                              "stop_sequence": None},
-                    "usage": {"output_tokens": int(meta.get("output_tokens") or 0)},
-                    "fugal": meta})
-                sse("message_stop", {"type": "message_stop"})
-                add_spend(meta["cost"], public)
-                print(f"[serve] anthropic stream ok  worker={meta['final_model']}  "
-                      f"${meta['cost']:.5f}  hist={len(history or [])}  "
-                      f"tier={'public' if public else 'full'}", flush=True)
-            except BrokenPipeError:
-                pass
-
-        def log_message(self, *a):
-            pass
-
-    srv = ThreadingHTTPServer((host, port), H)
+    # ---- startup banner ----------------------------------------------------------
     auth = "bearer-auth ON" if token else "no auth (bind localhost only)"
     cap = f"spend cap ${spend_cap}" if spend_cap is not None else "no spend cap"
     pub = (f"public tier ON: ${daily_cap}/day, {rate_limit}/min/IP"
@@ -715,23 +853,19 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     print(f"  browser: CORS {'allowed for ' + ', '.join(sorted(cors)) if cors else 'OFF'}"
           f"; Host check {'ON (' + ', '.join(sorted(hosts_ok)) + ')' if loopback_bind else 'OFF (non-loopback bind)'}")
     if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):
-        # Say it at startup rather than letting every answer come back as a 401 from
-        # OpenRouter that reads like our bug.
         print("  ⚠ no FUGAL_API_KEY set — POST /v1/route works, answers will fail")
     print("  GET /health · GET /v1/models")
     print("  POST /v1/chat/completions (OpenAI shape) · POST /v1/messages (Anthropic shape)")
     print("  POST /v1/route ($0, no key)")
+
+    import uvicorn
     try:
-        srv.serve_forever()
+        uvicorn.run(app, host=host, port=port, log_level="warning")
     except KeyboardInterrupt:
         print("\nshutting down")
-        srv.shutdown()
 
 
 def main():
-    # The ranked table, the help text and the error messages use em-dashes; a Windows
-    # console defaults to cp1252 and raises on them. Only when run as a program: importing
-    # fugal.serve must not reach in and rebind a library user's streams.
     use_utf8()
     ap = argparse.ArgumentParser(
         prog="python -m fugal",

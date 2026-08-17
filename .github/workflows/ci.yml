@@ -25,7 +25,7 @@ jobs:
       # loop. numpy is the only dependency reaching them (via router.py).
       - name: Wire-shape adapter tests
         run: |
-          pip install -q numpy
+          pip install -q numpy starlette uvicorn httpx
           python -m unittest discover -s tests -v
 
       - name: Head properties (pure numpy, no backbone)
@@ -90,7 +90,7 @@ jobs:
       - name: Install (CPU torch)
         run: |
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -q transformers numpy requests huggingface_hub
+          pip install -q transformers numpy requests huggingface_hub starlette uvicorn httpx
 
       - name: Fetch the backbone
         run: python scripts/fetch_backbone.py
