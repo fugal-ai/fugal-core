@@ -10,8 +10,32 @@ version here. Head changes are called out explicitly under their release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Async server rewrite.** `ThreadingHTTPServer` replaced with Starlette + uvicorn. Real
+  SSE streaming from OpenRouter via httpx — clients see tokens as they arrive instead of
+  receiving a buffered response. The torch forward pass runs in `asyncio.to_thread()` so it
+  never blocks the event loop. CORS and Host-rebinding checks moved to a clean ASGI
+  middleware layer. All endpoints, auth, spend caps, and rate limiting unchanged.
+- New dependencies: `starlette`, `uvicorn`, `httpx`.
+- CI Actions bumped: `actions/checkout@v7`, `actions/setup-python@v7`, `actions/cache@v6`.
+
+### Fixed
+
+- File handle leak in `Fugal.__init__` (`json.load(open(...))` → `with` statement).
+- Non-transient OpenRouter errors no longer waste retries (raised as `ValueError` with
+  immediate re-raise instead of `RuntimeError` caught by the retry loop).
+- Constructor now warns when a head model has no price entry.
+
+### Added
+
+- `tests/test_router_math.py` — 7 unit tests covering sigmoid, L2 normalization,
+  independent rows, lambda monotonicity, and price calculation.
+
 ### Removed
 
+- `fugal/_console.py` — `use_utf8()` consolidated into `fugal/__init__.py`.
+- `data/eval_fixture.example.jsonl` — format is documented in `docs/EVALUATION.md`.
 - `deploy/` — 233 lines describing one specific production host, and the only part of the
   repo nobody had executed. `setup_arm.sh` in particular cloned a URL and apt-installed as
   root. What was reusable (the unit's `ExecStart`, the spend cap, `MemoryMax`) is now a
@@ -52,8 +76,7 @@ version here. Head changes are called out explicitly under their release.
 - `verify/verify_calibration.py` + `docs/EVALUATION.md` — per-model AUC/Brier, pooled ECE
   with a reliability table, and routed accuracy-and-cost against five baselines including a
   hindsight-chosen best fixed model and a per-question oracle. Needs a graded fixture,
-  which this repo does not ship; `docs/EVALUATION.md` specifies the format and
-  `data/eval_fixture.example.jsonl` shows the shape.
+  which this repo does not ship; `docs/EVALUATION.md` specifies the format.
 - `tests/test_adapters.py` — 45 stdlib `unittest` cases over the wire-shape adapters
   (`anthropic_to_body`, tool-call conversion in both directions, `compose_system`,
   `clamp_max_tokens`, `clean_history`). No network, no backbone, runs in milliseconds, and

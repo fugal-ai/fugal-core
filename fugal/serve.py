@@ -23,7 +23,7 @@ Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone director
 from __future__ import annotations
 import argparse, asyncio, hmac, json, os, sys, time, uuid
 
-from ._console import use_utf8
+from . import use_utf8
 from .router import (Fugal, clamp_max_tokens, compose_system,                    # noqa: F401
                      or_request, or_call, OR_URL)
 

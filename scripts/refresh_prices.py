@@ -36,7 +36,7 @@ import argparse, io, json, os, sys, urllib.request
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)                                # run from anywhere
 
-from fugal._console import use_utf8                     # noqa: E402
+from fugal import use_utf8                               # noqa: E402
 HEAD = os.path.join(REPO, "data", "router_head.npz")
 PRICES = os.path.join(REPO, "data", "models_2026-06.json")
 OR_MODELS = "https://openrouter.ai/api/v1/models"       # public, needs no key

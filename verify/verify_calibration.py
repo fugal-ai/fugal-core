@@ -32,7 +32,7 @@ sys.path.insert(0, REPO)
 os.environ.pop("FUGAL_API_KEY", None)          # nothing here may make a paid call
 os.environ.pop("OPENROUTER_API_KEY", None)
 
-from fugal._console import use_utf8            # noqa: E402
+from fugal import use_utf8                      # noqa: E402
 
 MIN_ROWS = 50          # below this, sampling noise swamps every number printed
 
@@ -112,8 +112,7 @@ def main():
         sys.exit(f"no fixture at {args.fixture}\n"
                  f"  This repo ships the router, not the study behind it. "
                  f"docs/EVALUATION.md\n"
-                 f"  specifies the format and how to produce one; "
-                 f"data/eval_fixture.example.jsonl shows the shape.")
+                 f"  specifies the fixture format and how to produce one.")
 
     rows = load_fixture(args.fixture)
     if not rows:

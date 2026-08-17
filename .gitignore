@@ -12,8 +12,7 @@ artifacts/
 *.safetensors
 *.npy
 .env
-# your own graded evaluation fixture and its hidden-state cache (docs/EVALUATION.md).
-# data/eval_fixture.example.jsonl is tracked; a real one is yours to publish or not.
+# your own graded evaluation fixture and its hidden-state cache (docs/EVALUATION.md)
 data/eval_fixture.jsonl
 *.hidden.npz
 # local rollback copies (e.g. serve.py.bak-trim) — git history is the real backup

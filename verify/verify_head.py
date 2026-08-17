@@ -33,7 +33,7 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from fugal._console import use_utf8                     # noqa: E402
+from fugal import use_utf8                               # noqa: E402
 use_utf8()                                              # em-dashes below vs a cp1252 console
 
 HEAD = os.environ.get("FUGAL_HEAD") or os.path.join(REPO, "data", "router_head.npz")

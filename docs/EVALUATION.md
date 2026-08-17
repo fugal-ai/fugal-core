@@ -44,9 +44,8 @@ JSONL, one question per line. `//` lines and blank lines are skipped.
 - Any other key is ignored. `id` and `source` are recommended so a surprising number can be
   chased back to a question.
 
-`data/eval_fixture.example.jsonl` shows the shape. **Its outcomes are placeholders, not
-measurements** — the script refuses to print metrics for a fixture that small unless you
-pass `--allow-tiny`, which exists for checking plumbing, never for quoting.
+The script refuses to print metrics for a fixture smaller than 50 rows unless you pass
+`--allow-tiny`, which exists for checking plumbing, never for quoting.
 
 ## Two requirements that decide whether the numbers mean anything
 
