@@ -55,10 +55,10 @@ logistic head on its own training set reports how well it memorised, in the flat
 direction, with no warning that it is doing so.
 
 **Same conditioning.** Hidden states must come from an unmodified `Qwen/Qwen3-0.6B` under
-the same `ROUTER_SYSTEM_PROMPT` with `num_agents=7`, transcript formatted as raw
-`role: content`. `verify_calibration.py` uses the shipped constants automatically, so this
-only bites if you are grading against a head you fit under different conditioning — see
-docs/HEAD_FORMAT.md.
+the same `ROUTER_SYSTEM_PROMPT`, transcript formatted as raw `role: content`, mean-pooled
+across all input tokens. `verify_calibration.py` uses the shipped constants automatically,
+so this only bites if you are grading against a head you fit under different conditioning —
+see docs/HEAD_FORMAT.md.
 
 ## Running it
 

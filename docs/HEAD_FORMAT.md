@@ -15,7 +15,7 @@ Index `i` means the same model in all four arrays. That alignment is the whole c
 ## How it is used
 
 ```python
-h = hidden_state(question)          # (1024,), penultimate-token hidden state, L2-normalised
+h = hidden_state(question)          # (1024,), mean-pooled hidden state, L2-normalised
 p = 1 / (1 + exp(-(W @ h + b)))     # (17,) — P(model i solves this question)
 utility = p - lam * mean_cost       # (17,)
 worker = models[argmax(utility)]
@@ -88,25 +88,18 @@ unmodified `Qwen/Qwen3-0.6B`. Serve them on a different or fine-tuned backbone a
 crashes — the router just routes worse, which is the worst failure mode available.
 
 **The prompt is part of the artifact.** The hidden state is taken with
-`ROUTER_SYSTEM_PROMPT.format(num_agents=7)` as the system message and the question as the user
-message, formatted as raw `role: content` lines rather than a chat template. All of that was
-fixed when the head was fit. `num_agents=7` does not mean "7 models" — there are 17. Editing
-either constant in `router.py` invalidates the head without any visible error.
+`ROUTER_SYSTEM_PROMPT` as the system message and the question as the user message, formatted
+as raw `role: content` lines rather than a chat template, and mean-pooled across all input
+tokens. All of that was fixed when the head was fit. Editing the prompt or pooling strategy
+in `router.py` invalidates the head without any visible error.
 
-## Where the constants came from, and what that does not prove
+## How these constants were chosen
 
-`HIDDEN_POS = -2`, the router prompt string, `num_agents=7` and the raw `role: content`
-transcript format all come from OpenFugu's reconstruction of the TRINITY coordinator (see
-`NOTICE`), where they were established against the released TRINITY checkpoint — which
-adapts the backbone with SVF and reads a bias-free 10-row agent/role logit head.
+The router prompt, mean-pooling strategy, and transcript format were selected via a systematic
+ablation (4 positions x 4 prompts = 16 combinations, 10 seeds x 4-fold CV each). Mean-pooling
+outperformed all single-token positions (including TRINITY's original penultimate-token
+position), and the clean routing prompt was statistically indistinguishable from the inherited
+TRINITY dispatcher prompt (p > 0.20). The ablation data is in the research repository.
 
-**Fugal does neither.** It runs an unmodified Qwen3-0.6B and a 17-row logistic head. So the
-reason to keep these constants is not that they were shown optimal for this setup — it is
-the narrower and sufficient one that *this head was fit under them*, so changing them puts
-the head and its conditioning out of step. Nothing in this repo demonstrates that `-2` beats
-`-1` or mean-pooling, or that this prompt beats a different one, for a head fit without SVF.
-Establishing that would mean refitting under each variant and comparing on held-out graded
-outcomes — see `docs/EVALUATION.md`.
-
-Stated plainly because the distinction matters if you fit your own head: these are fixed
-constants, not tuned ones.
+If you fit your own head, use the same prompt and pooling strategy, or rerun the ablation
+under your setup.

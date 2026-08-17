@@ -18,10 +18,10 @@ python verify/verify_routing.py         # needs the backbone; no key, no spend
 
 ## Things that look like cleanups and are not
 
-- [ ] I did **not** change `ROUTER_SYSTEM_PROMPT`, `ROUTER_NUM_AGENTS`, `HIDDEN_POS`, the
-      raw `role: content` transcript format, or the L2 normalisation of `h`. These are part
-      of the trained artifact — changing any of them degrades routing silently, with no
-      error. (If the change is deliberate, say so and explain how the head was refit.)
+- [ ] I did **not** change `ROUTER_SYSTEM_PROMPT`, the mean-pooling in `hidden()`, the raw
+      `role: content` transcript format, or the L2 normalisation of `h`. These are part of
+      the trained artifact — changing any of them degrades routing silently, with no error.
+      (If the change is deliberate, say so and explain how the head was refit.)
 - [ ] I did **not** hand-edit `data/router_head.npz`. A row of `W` is measured, not derived
       (`docs/HEAD_FORMAT.md`).
 - [ ] Nothing here belongs to the private half of the codebase — billing, accounts, API-key

@@ -123,11 +123,11 @@ def main():
                  f"these numbers to mean anything.\n  Pass --allow-tiny to run anyway (for "
                  f"checking the plumbing, never for quoting).")
 
-    from fugal.router import Fugal, ROUTER_SYSTEM_PROMPT, ROUTER_NUM_AGENTS
+    from fugal.router import Fugal, ROUTER_SYSTEM_PROMPT
     f2 = Fugal(router_lambda=args.router_lambda)
     # Same conditioning the live router uses. Reproduced here rather than calling route()
     # because we need the hidden state itself, not the ranking it produces.
-    router_sys = ROUTER_SYSTEM_PROMPT.format(num_agents=ROUTER_NUM_AGENTS)
+    router_sys = ROUTER_SYSTEM_PROMPT
     models, mean_cost, lam = f2.models, f2.mean_cost, f2.lam
 
     graded = [m for m in models if all(m in s for _, s in rows)]

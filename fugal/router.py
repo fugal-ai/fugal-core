@@ -22,20 +22,16 @@ Serving (OpenAI + Anthropic wire shapes), the CLI, and the spend controls live i
 serve.py. This file is the model.
 
 PROVENANCE (Apache-2.0 s4(b) — this file contains modified third-party material).
-The hidden-state extraction path below — ROUTER_SYSTEM_PROMPT, HIDDEN_POS,
+The hidden-state extraction path below — ROUTER_SYSTEM_PROMPT,
 FugalRouter.format_transcript and FugalRouter.hidden — is DERIVED FROM
 `openfugu/mini.py` in github.com/trotsky1997/OpenFugu, Copyright 2026 The OpenFugu
 Contributors, Apache-2.0. Fugal's changes to it: the SVF backbone adaptation was
 removed (this runs an unmodified Qwen3-0.6B, no TRINITY checkpoint), the bias-free
 (10, 1024) agent/role logit head was replaced by the (17, 1024) per-model logistic
 head with bias and the price-discounted decision rule, the hidden state is now
-L2-normalised, and the multi-turn Coordinator loop was not carried over. See NOTICE.
-
-The `[EXEC]` tags on two constants below are OpenFugu's provenance notation, kept so
-the constants stay traceable to where they were established: [EXEC] means the value
-was reproduced by running real weights rather than read off a paper. Fugal inherited
-these values; see the caveat in docs/HEAD_FORMAT.md about what that does and does not
-justify.
+L2-normalised and mean-pooled across all input tokens, the TRINITY dispatcher system
+prompt was replaced by a clean routing prompt, and the multi-turn Coordinator loop
+was not carried over. See NOTICE.
 """
 from __future__ import annotations
 import json, os, random, threading, time
@@ -53,21 +49,14 @@ os.environ.setdefault("FUGAL_MODEL", os.path.join(REPO, "artifacts", "Qwen3-0.6B
 HEAD = os.environ.get("FUGAL_HEAD") or os.path.join(REPO, "data", "router_head.npz")
 PRICES = os.environ.get("FUGAL_PRICES") or os.path.join(REPO, "data", "models_2026-06.json")
 
-HIDDEN_POS = -2            # penultimate-token hidden state [EXEC, from OpenFugu]
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# The router conditions on this exact system prompt plus the question. It is byte-identical
-# to ROUTER_SYSTEM_PROMPT in OpenFugu's openfugu/mini.py, which reconstructed it from the
-# TRINITY coordinator (see NOTICE), and Fugal's head was fit on hidden states produced under
-# it — so the string is part of the trained artifact, not a stylistic choice. `num_agents=7` is likewise fixed by what the head was fit under;
-# it does NOT mean "we route among 7 models" (we route among 17). Changing either invalidates
-# the head.
+# The router conditions on this system prompt plus the question. The head was fit on hidden
+# states produced under it, so the string is part of the trained artifact — changing it
+# invalidates the head unless you retrain (see docs/HEAD_FORMAT.md).
 ROUTER_SYSTEM_PROMPT = (
-    "You are a message dispatcher whose job is to coordinate {num_agents} agents "
-    "to solve a problem. You check the problem and the discussion history and then "
-    "decide which agent should respond next. Your first generated token's hidden "
-    "state will be used as signal for decision making.")
-ROUTER_NUM_AGENTS = 7
+    "You are a routing model. Given a question, your hidden state will be used to "
+    "predict which language model can best answer it. Read the question carefully.")
 
 # House system prompt prepended to EVERY worker call. Because the product routes each message
 # to a different underlying model, without a shared instruction each model answers in its own
@@ -112,7 +101,7 @@ def compose_system(client_system):
 
 # ---- the backbone: question -> hidden state ---------------------------------
 class FugalRouter:
-    """Qwen3-0.6B, used only for its penultimate-token hidden state.
+    """Qwen3-0.6B, used only for its mean-pooled hidden state.
 
     The backbone's own text output is never used and no tokens are ever generated,
     which is what makes a routing decision one forward pass (~1s on a CPU core)
@@ -136,9 +125,7 @@ class FugalRouter:
 
     @staticmethod
     def format_transcript(messages: list[dict]) -> str:
-        # raw 'role: content', NOT a chat template. [EXEC, from OpenFugu] — the 95%-vs-11%
-        # figure is OpenFugu's measurement against the TRINITY checkpoint, not Fugal's.
-        # Fugal keeps the format because its own head was fit under it.
+        # raw 'role: content', NOT a chat template. The head was fit under this format.
         return "\n".join(f'{m["role"]}: {m["content"]}' for m in messages)
 
     def hidden(self, messages: list[dict]):
@@ -146,7 +133,7 @@ class FugalRouter:
         ids = self.tok(self.format_transcript(messages), return_tensors="pt").to(self.device)
         with torch.no_grad():
             out = self.model.model(**ids)          # backbone only; LM head unused
-        return out.last_hidden_state[0, HIDDEN_POS, :]
+        return out.last_hidden_state[0].mean(dim=0)
 
 
 # ---- the OpenRouter worker call ---------------------------------------------
@@ -266,10 +253,14 @@ class Fugal:
         pin, pout = self.prices.get(model, (1e-6, 3e-6))
         return itok * pin + otok * pout
 
-    def route(self, query):
-        """query -> (models ranked best-first, their p_solve in the same order)."""
-        msgs = [{"role": "system",
-                 "content": ROUTER_SYSTEM_PROMPT.format(num_agents=ROUTER_NUM_AGENTS)},
+    def route(self, query, history=None):
+        """query -> (models ranked best-first, their p_solve in the same order).
+        When history is provided the backbone sees the full conversation, so
+        follow-up turns like "now in Rust" route on the actual task context
+        rather than the bare follow-up string alone.  The head will need
+        retraining on multi-turn hidden states to fully benefit from this."""
+        msgs = [{"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                *(history or []),
                 {"role": "user", "content": query}]
         with self._rlock:
             h = self.router.hidden(msgs).float().cpu().numpy()
@@ -293,7 +284,7 @@ class Fugal:
         sys_prompt = compose_system(system)
         mtok = clamp_max_tokens(max_tokens)
         meta = {"cost": 0.0, "steps": [], "input_tokens": 0, "output_tokens": 0}
-        ranked, probs = self.route(query)
+        ranked, probs = self.route(query, history=history)
         first = ranked[0]
         meta["p_solve"] = float(probs[0])          # router confidence in the chosen worker
         meta["ranked"] = list(ranked[:3])

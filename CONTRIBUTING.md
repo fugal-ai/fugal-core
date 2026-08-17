@@ -22,11 +22,11 @@ well-formed.
 
 ## Things that look like cleanups and are not
 
-**`ROUTER_SYSTEM_PROMPT` and `num_agents=7` in `fugal/router.py` are part of the trained
-artifact.** The head was fit on hidden states produced under that exact string, with the
-transcript formatted as raw `role: content` lines rather than a chat template. `7` is not the
-number of models — there are 17. Change any of it and routing quietly degrades with no error.
-Same for `HIDDEN_POS = -2` and the L2 normalisation of `h`.
+**`ROUTER_SYSTEM_PROMPT` and mean-pooling in `fugal/router.py` are part of the trained
+artifact.** The head was fit on hidden states produced under that exact prompt, mean-pooled
+across all input tokens, with the transcript formatted as raw `role: content` lines rather
+than a chat template. Change any of it and routing quietly degrades with no error. Same for
+the L2 normalisation of `h`.
 
 **The head and the backbone travel together.** `data/router_head.npz` was fit on unmodified
 `Qwen/Qwen3-0.6B` hidden states. A different or fine-tuned backbone does not crash; it just

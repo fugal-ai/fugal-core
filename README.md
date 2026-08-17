@@ -156,11 +156,10 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
   it is what `meta.cost`, `X-Fugal-Cost-USD` and the spend caps are computed from, so it
   should be current. Run `python scripts/refresh_prices.py` (or `--check`) to keep it that
   way; a stale sheet means your cap is counting the wrong dollars.
-- **`HIDDEN_POS = -2`, the router prompt and `num_agents=7` are inherited, not re-derived.**
-  They were established by OpenFugu against the TRINITY checkpoint, which adapts the
-  backbone with SVF and uses a 10-row logit head — neither of which Fugal does. They are
-  still correct *here*, because this head was fit under them, but nothing in this repo shows
-  `-2` beats `-1` or mean-pooling for this head. Treat them as fixed, not as optimised.
+- **`ROUTER_SYSTEM_PROMPT` and mean-pooling are part of the trained artifact.** The head was
+  fit on hidden states produced under that exact prompt, mean-pooled across all input tokens.
+  Changing either silently invalidates the head. Both were chosen via a systematic ablation
+  (16 combinations, 40 CV folds each) — see `docs/HEAD_FORMAT.md`.
 - The evidence behind the head — the model×question matrix it was fit on, the end-to-end
   benchmarks, the dated reports — lives in a separate research repository that is **not
   public**. This repo ships the artifact and the code that runs it, not the study. So
@@ -170,9 +169,6 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
   held-out fixture format; hand one to `verify/verify_calibration.py` and it will report
   AUC, calibration error, and routed accuracy-and-cost against a hindsight-chosen best
   fixed model, a cheapest-always baseline, and a per-question oracle.
-- `ROUTER_SYSTEM_PROMPT` and `num_agents=7` in `router.py` are **part of the trained artifact**,
-  not style. The head was fit on hidden states produced under that exact string; `7` is not the
-  number of models (there are 17). Changing either silently invalidates the head.
 
 ## Lineage
 

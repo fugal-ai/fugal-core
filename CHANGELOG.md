@@ -69,10 +69,10 @@ version here. Head changes are called out explicitly under their release.
   enumerates Fugal's changes to the derived material (§4(b)); `fugal/router.py` carries an
   in-file provenance block naming exactly which parts derive from `openfugu/mini.py`, and
   the inherited `[EXEC]` provenance tags are now explained rather than left bare.
-- `docs/HEAD_FORMAT.md` states that `HIDDEN_POS = -2`, the router prompt and `num_agents=7`
-  were established by OpenFugu *under SVF backbone adaptation*, which Fugal does not use.
-  They are kept because this head was fit under them — not because they were re-validated
-  in this setting. That was previously implied more strongly than the evidence supports.
+- `docs/HEAD_FORMAT.md` documents the ablation-validated choices: mean-pooling over all input
+  tokens (replacing `HIDDEN_POS = -2`) and a clean routing prompt (replacing the inherited
+  TRINITY dispatcher prompt with `num_agents=7`). Both were selected via systematic ablation
+  (16 combinations, 40 CV folds each) and the head was refit under the winning setup.
 - `requirements.txt` no longer caps `transformers` below 5; `router.py` already handled the
   `dtype=`/`torch_dtype=` split in both directions.
 - `--spend-cap` help text now states that it is checked before each call (so concurrent

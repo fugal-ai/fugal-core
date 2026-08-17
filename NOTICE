@@ -25,7 +25,7 @@ Source: github.com/trotsky1997/OpenFugu
 Fugal is a DERIVATIVE WORK of OpenFugu and the above attribution is reproduced
 per Apache-2.0 section 4(d). Portions of `fugal/router.py` are derived from
 OpenFugu's `openfugu/mini.py` (Apache-2.0), specifically the router's
-hidden-state extraction path: `ROUTER_SYSTEM_PROMPT`, `HIDDEN_POS`,
+hidden-state extraction path: `ROUTER_SYSTEM_PROMPT`,
 `format_transcript`, and `FugalRouter.hidden`.
 
 Changes made by Fugal to that material, per Apache-2.0 section 4(b):
@@ -35,8 +35,10 @@ Changes made by Fugal to that material, per Apache-2.0 section 4(b):
   - The bias-free (10, 1024) agent/role logit head was REPLACED by Fugal's own
     (17, 1024) per-model logistic head with bias, plus the price-discounted
     decision rule `utility = p - lam * mean_cost`.
-  - The hidden state is L2-normalised before scoring; OpenFugu does not
-    normalise it.
+  - The hidden state is L2-normalised and mean-pooled across all input tokens;
+    OpenFugu uses a single penultimate-token position.
+  - The TRINITY dispatcher system prompt was replaced by a clean routing prompt
+    describing the actual task; the `num_agents` placeholder was removed.
   - The multi-turn Coordinator loop, its role injection, and its termination
     conditions were not carried over: Fugal makes ONE worker call per turn.
   - Everything in `fugal/serve.py`, `scripts/`, `verify/`, `deploy/`, `docs/`
