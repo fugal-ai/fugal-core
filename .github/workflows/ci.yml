@@ -51,11 +51,17 @@ jobs:
           models = [str(m) for m in z["models"]]
           n = len(models)
           assert z["W"].shape == (n, 1024), z["W"].shape
-          assert z["b"].shape == (n,) and z["mean_cost"].shape == (n,)
+          assert z["b"].shape == (n,)
+          v2 = "mean_in_tokens" in z.files
+          if v2:  # docs/HEAD_FORMAT.md: routing cost computed from the sheet at load
+              assert z["mean_in_tokens"].shape == (n,) and z["mean_out_tokens"].shape == (n,)
+          else:
+              assert z["mean_cost"].shape == (n,)
           priced = {m["id"] for m in json.load(open("data/models_2026-06.json"))}
           missing = [m for m in models if m not in priced]
           assert not missing, f"no price for {missing}"
-          print(f"head OK: {n} models, lambda={float(z['lam']):g}, all priced")
+          print(f"head OK ({'v2' if v2 else 'v1'}): {n} models, "
+                f"lambda={float(z['lam']):g}, all priced")
           PY
 
       # This repo is the public half of a codebase whose private half runs billing. A

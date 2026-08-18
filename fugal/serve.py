@@ -18,7 +18,8 @@ Usage:
 Add --models "a,b,c" (or set FUGAL_MODELS) to route among a subset of the head's 17 models —
 useful when you hold keys for some providers and not others. See docs/HEAD_FORMAT.md.
 
-Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone directory).
+Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone directory),
+FUGAL_HEAD (your own head), FUGAL_LAMBDA (cost sensitivity), FUGAL_MODELS (subset).
 """
 from __future__ import annotations
 import argparse, asyncio, hmac, json, os, sys, time, uuid
@@ -31,14 +32,18 @@ from .router import (Fugal, clamp_max_tokens, compose_system,                   
 def client_system_from_body(body):
     """The caller's own system prompt, pulled from wherever their client shape put it: a
     top-level `system` field (Anthropic, set by anthropic_to_body) or system-role messages
-    (OpenAI). Joined into one string so it can be appended to the house prompt rather than
-    silently dropped, which is what clean_history() used to do to it."""
+    (OpenAI). List-shaped content is flattened — OpenAI content parts use the same
+    {"type":"text"} block shape Anthropic does. Joined into one string so it can be
+    appended to the house prompt rather than silently dropped."""
     if body.get("system"):
         return body["system"]
-    parts = [m.get("content") for m in (body.get("messages") or [])
-             if isinstance(m, dict) and m.get("role") == "system"
-             and isinstance(m.get("content"), str)]
-    return "\n\n".join(p for p in parts if p and p.strip())
+    parts = []
+    for m in (body.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "system":
+            c = anthropic_text(m.get("content"))
+            if c and c.strip():
+                parts.append(c)
+    return "\n\n".join(parts)
 
 
 # ---- Anthropic <-> OpenAI shape adapters -------------------------------------
@@ -173,18 +178,38 @@ def anthropic_response(req_id, text, meta):
 
 def clean_history(body, max_msgs=12, max_chars=24000):
     """Sanitize a chat request's messages[:-1] into a worker-safe history list:
-    only user/assistant string turns, each capped, oldest dropped past the budget."""
+    only user/assistant text turns (content parts flattened), each capped, oldest
+    dropped past the budget."""
     hist = []
     for m in (body.get("messages") or [])[:-1]:
         if not isinstance(m, dict):
             continue
         role, content = m.get("role"), m.get("content")
+        if isinstance(content, list):
+            content = anthropic_text(content)      # OpenAI parts share the text-block shape
         if role in ("user", "assistant") and isinstance(content, str) and content.strip():
             hist.append({"role": role, "content": content[:8000]})
     hist = hist[-max_msgs:]
     while hist and sum(len(m["content"]) for m in hist) > max_chars:
         hist.pop(0)
     return hist
+
+
+def routing_query(messages, fallback=""):
+    """What the ROUTER reads: the latest user turn with non-empty text.
+
+    Never a tool result and never assistant text — the head was fit on user questions,
+    and on a tool-loop continuation the last message is a tool RESULT (a directory
+    listing, file contents), which the head cannot score. Routing on the originating
+    user turn instead also makes the decision deterministic across a whole tool loop:
+    same turn, same hidden state, same worker — sticky routing with no state."""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            t = anthropic_text(m.get("content")) if not isinstance(m.get("content"), str) \
+                else m["content"]
+            if t and t.strip():
+                return t
+    return fallback
 
 
 # ---- the routing inspector: what the router would do, for $0 -----------------
@@ -252,8 +277,11 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     cors = set(cors_origins or [])
     loopback_bind = host in ("127.0.0.1", "localhost", "::1")
     hosts_ok = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in (allow_hosts or [])}
+    # The meter is touched ONLY from the event loop, by functions that never await, so
+    # every read-modify-write is atomic with respect to other coroutines — no lock. This
+    # is load-bearing: add_spend must also be callable from a generator's cleanup path
+    # (client disconnected mid-stream), where awaiting is not an option.
     meter = {"spent": 0.0, "n": 0, "day": None, "day_spent": 0.0}
-    meter_lock = asyncio.Lock()
     hits: dict[str, deque] = {}
     hits_lock = asyncio.Lock()
     MAX_BODY = 256 * 1024
@@ -267,13 +295,12 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             meter["day"], meter["day_spent"] = d, 0.0
         return meter["day_spent"]
 
-    async def add_spend(cost, public):
-        async with meter_lock:
-            meter["spent"] += cost
-            meter["n"] += 1
-            if public:
-                _day_spent()
-                meter["day_spent"] += cost
+    def add_spend(cost, public):
+        meter["spent"] += cost
+        meter["n"] += 1
+        if public:
+            _day_spent()
+            meter["day_spent"] += cost
 
     async def rate_limited(ip, limit=rate_limit, window=60.0):
         now = time.time()
@@ -328,11 +355,13 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 return xff.split(",")[0].strip()
         return peer
 
-    async def capped():
-        async with meter_lock:
-            return spend_cap is not None and meter["spent"] >= spend_cap
+    def capped():
+        return spend_cap is not None and meter["spent"] >= spend_cap
 
     def read_body(raw, anthropic=False):
+        """-> (worker query, routing query, body). The worker query is the last message
+        (what the model must respond to); the routing query is the latest USER text turn
+        (what the head can score) — they differ on tool-loop continuations."""
         if anthropic:
             body = anthropic_to_body(raw)
             body["stream"] = bool(raw.get("stream"))
@@ -342,13 +371,16 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 body["tools"] = anthropic_tools_to_openai(raw.get("tools"))
         else:
             body = raw
-        if "messages" in body:
-            q = body["messages"][-1]["content"]
+        if body.get("messages"):
+            last = body["messages"][-1]
+            q = last.get("content") if isinstance(last, dict) else None
+            if isinstance(q, list):
+                q = anthropic_text(q)          # OpenAI content parts, same block shape
         else:
-            q = body["query"]
+            q = body.get("query")
         if not isinstance(q, str) or not q.strip():
             raise ValueError("query must be a non-empty string")
-        return q, body
+        return q, routing_query(body.get("messages"), fallback=q), body
 
     def _build_or_messages(q, hist, tools, msgs, sys_prompt):
         if tools:
@@ -363,9 +395,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     # ---- route handlers ----------------------------------------------------------
 
     async def health(request):
-        async with meter_lock:
-            ds = _day_spent()
-            m = dict(meter)
+        ds = _day_spent()
+        m = dict(meter)
         return _json(200, {"status": "ok", "queries": m["n"],
                            "spend_usd": round(m["spent"], 5),
                            "spend_cap_usd": spend_cap,
@@ -387,13 +418,13 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         except Exception:
             return _err(400, "body must be valid JSON", request)
         try:
-            q, _ = read_body(raw)
+            _, rq, _ = read_body(raw)
         except Exception:
             return _err(400, "body must be JSON with messages[].content or a query field",
                         request)
-        if len(q) > 8000:
+        if len(rq) > 8000:
             return _err(400, "query too long for the router (8000 chars max)", request)
-        ranked, probs = await asyncio.to_thread(f2.route, q)
+        ranked, probs = await asyncio.to_thread(f2.route, rq)
         mc = {m: float(c) for m, c in zip(f2.models, f2.mean_cost)}
         return _json(200, {
             "object": "fugal.route",
@@ -415,9 +446,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             if await rate_limited("c|" + client_ip(request)):
                 return _err(429, "rate limit exceeded; try again in a minute",
                             request, "rate_limit_error")
-            async with meter_lock:
-                exhausted = _day_spent() >= daily_cap
-            if exhausted:
+            if _day_spent() >= daily_cap:
                 return _err(402, "the daily budget is used up — resets at midnight UTC; "
                                  "route-only mode (POST /v1/route) stays free",
                             request, "spend_cap_error")
@@ -429,13 +458,13 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         except Exception:
             return _err(400, "body must be valid JSON", request)
         try:
-            q, body = read_body(raw, anthropic=anthropic)
+            q, rq, body = read_body(raw, anthropic=anthropic)
         except Exception:
             return _err(400, "body must be JSON with messages[].content or a query field",
                         request)
         if public and len(q) > 4000:
             return _err(400, "query too long for the public tier (4000 chars max)", request)
-        if await capped():
+        if capped():
             return _err(402, f"spend cap ${spend_cap} reached; restart to reset",
                         request, "spend_cap_error")
 
@@ -445,28 +474,32 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         msgs = body.get("messages") if tools else None
         csys = client_system_from_body(body)
         mtok = body.get("max_tokens")
-        try:
-            temp = float(body.get("temperature", 0.0))
-        except (TypeError, ValueError):
-            temp = 0.0
+        # None = the caller sent no temperature, and none is forwarded — each worker
+        # keeps its provider default rather than inheriting an opinion of ours.
+        temp = body.get("temperature")
+        if temp is not None:
+            try:
+                temp = float(temp)
+            except (TypeError, ValueError):
+                temp = None
 
         if body.get("stream"):
             if anthropic:
                 return StreamingResponse(
-                    _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id,
+                    _stream_anthropic(q, rq, public, hist, tools, msgs, csys, mtok, req_id,
                                       temperature=temp),
                     media_type="text/event-stream",
                     headers={"cache-control": "no-cache", "connection": "close"})
             return StreamingResponse(
-                _stream_openai(q, public, hist, tools, msgs, csys, mtok,
+                _stream_openai(q, rq, public, hist, tools, msgs, csys, mtok,
                                temperature=temp),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache", "connection": "close"})
 
         reply, meta = await asyncio.to_thread(
             f2.answer, q, history=hist, tools=tools, messages=msgs,
-            system=csys, max_tokens=mtok, temperature=temp)
-        await add_spend(meta["cost"], public)
+            system=csys, max_tokens=mtok, temperature=temp, route_on=rq)
+        add_spend(meta["cost"], public)
 
         extra = {"x-fugal-cost-usd": f"{meta['cost']:.6f}"}
         if anthropic:
@@ -510,186 +543,86 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
 
     # ---- real streaming ----------------------------------------------------------
 
-    async def _stream_openai(q, public, hist, tools, msgs, csys, mtok, temperature=0.0):
+    async def _stream_openai(q, rq, public, hist, tools, msgs, csys, mtok, temperature=None):
         """Real SSE streaming for the OpenAI wire shape via httpx."""
-        ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
+        ranked, probs = await asyncio.to_thread(
+            f2.route, rq, history=hist if f2.head_context == "multiturn" else None)
         first = ranked[0]
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
                 "final_model": first, "cost": 0.0, "steps": [],
                 "input_tokens": 0, "output_tokens": 0}
+        accumulated_tcalls = {}
+        usage = {}
+        settled = False
+
+        def settle():
+            # Runs exactly once: on the normal path, AND from `finally` when the client
+            # disconnects mid-stream (Starlette closes the generator), so streamed spend
+            # still counts against the caps. usage is OpenRouter's LAST chunk, so a very
+            # early disconnect can still under-count — the hard limit on the OpenRouter
+            # key itself remains the outermost brake (SECURITY.md).
+            nonlocal settled
+            if settled:
+                return
+            settled = True
+            itok = int(usage.get("prompt_tokens", 0))
+            otok = int(usage.get("completion_tokens", 0))
+            cost = f2._price(first, itok, otok)
+            meta["cost"] = cost
+            meta["input_tokens"] = itok
+            meta["output_tokens"] = otok
+            meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+            add_spend(cost, public)
+            print(f"[serve] stream ok  worker={first}  ${cost:.5f}  "
+                  f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
+                  f"tier={'public' if public else 'full'}", flush=True)
 
         def sse(obj):
             return f"data: {json.dumps(obj)}\n\n".encode()
 
-        yield sse({"id": cid, "object": "chat.completion.chunk",
-                   "model": f"fugal/{first}",
-                   "choices": [{"index": 0,
-                                "delta": {"role": "assistant", "content": ""},
-                                "finish_reason": None}],
-                   "fugal": {"stage": "route", "model": first,
-                             "p_solve": float(probs[0])}})
-
-        sys_prompt = compose_system(csys)
-        mtok_val = clamp_max_tokens(mtok)
-        or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
-        key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-        payload = {"model": first, "temperature": temperature, "max_tokens": mtok_val,
-                   "messages": or_msgs, "stream": True,
-                   "stream_options": {"include_usage": True}}
-        if tools:
-            payload["tools"] = tools
-
-        accumulated_tcalls = {}
-        usage = {}
-
         try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST", OR_URL, json=payload, timeout=180.0,
-                    headers={"Authorization": f"Bearer {key}",
-                             "Content-Type": "application/json"},
-                ) as response:
-                    if response.status_code != 200:
-                        body = (await response.aread()).decode(errors="replace")[:200]
-                        yield sse({"id": cid, "object": "chat.completion.chunk",
-                                   "model": f"fugal/{first}",
-                                   "choices": [{"index": 0,
-                                                "delta": {"content": f"[upstream error {response.status_code}: {body}]"},
-                                                "finish_reason": None}]})
-                        yield sse({"id": cid, "object": "chat.completion.chunk",
-                                   "model": f"fugal/{first}",
-                                   "choices": [{"index": 0, "delta": {},
-                                                "finish_reason": "stop"}]})
-                        yield b"data: [DONE]\n\n"
-                        return
-
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line or not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        u = chunk.get("usage")
-                        if u:
-                            usage = u
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        if "content" in delta and delta["content"]:
-                            yield sse({"id": cid, "object": "chat.completion.chunk",
-                                       "model": f"fugal/{first}",
-                                       "choices": [{"index": 0,
-                                                    "delta": {"content": delta["content"]},
-                                                    "finish_reason": None}]})
-                        if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                idx = tc.get("index", 0)
-                                if idx not in accumulated_tcalls:
-                                    accumulated_tcalls[idx] = {
-                                        "id": tc.get("id", ""), "type": "function",
-                                        "function": {"name": "", "arguments": ""}}
-                                if tc.get("id"):
-                                    accumulated_tcalls[idx]["id"] = tc["id"]
-                                fn = tc.get("function", {})
-                                if fn.get("name"):
-                                    accumulated_tcalls[idx]["function"]["name"] = fn["name"]
-                                if "arguments" in fn:
-                                    accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
-        except Exception as exc:
             yield sse({"id": cid, "object": "chat.completion.chunk",
                        "model": f"fugal/{first}",
                        "choices": [{"index": 0,
-                                    "delta": {"content": f"\n\n[stream error: {str(exc)[:100]}]"},
-                                    "finish_reason": None}]})
+                                    "delta": {"role": "assistant", "content": ""},
+                                    "finish_reason": None}],
+                       "fugal": {"stage": "route", "model": first,
+                                 "p_solve": float(probs[0])}})
 
-        itok = int(usage.get("prompt_tokens", 0))
-        otok = int(usage.get("completion_tokens", 0))
-        cost = f2._price(first, itok, otok)
-        meta["cost"] = cost
-        meta["input_tokens"] = itok
-        meta["output_tokens"] = otok
-        meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+            sys_prompt = compose_system(csys)
+            mtok_val = clamp_max_tokens(mtok)
+            or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
+            key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+            payload = {"model": first, "max_tokens": mtok_val,
+                       "messages": or_msgs, "stream": True,
+                       "stream_options": {"include_usage": True}}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if tools:
+                payload["tools"] = tools
 
-        tcalls = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
-        if tcalls:
-            meta["tool_calls"] = tcalls
-            yield sse({"id": cid, "object": "chat.completion.chunk",
-                       "model": f"fugal/{first}",
-                       "choices": [{"index": 0, "delta": {"tool_calls": tcalls},
-                                    "finish_reason": None}]})
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST", OR_URL, json=payload, timeout=180.0,
+                        headers={"Authorization": f"Bearer {key}",
+                                 "Content-Type": "application/json"},
+                    ) as response:
+                        if response.status_code != 200:
+                            body = (await response.aread()).decode(errors="replace")[:200]
+                            yield sse({"id": cid, "object": "chat.completion.chunk",
+                                       "model": f"fugal/{first}",
+                                       "choices": [{"index": 0,
+                                                    "delta": {"content": f"[upstream error {response.status_code}: {body}]"},
+                                                    "finish_reason": None}]})
+                            yield sse({"id": cid, "object": "chat.completion.chunk",
+                                       "model": f"fugal/{first}",
+                                       "choices": [{"index": 0, "delta": {},
+                                                    "finish_reason": "stop"}]})
+                            yield b"data: [DONE]\n\n"
+                            return
 
-        yield sse({"id": cid, "object": "chat.completion.chunk",
-                   "model": f"fugal/{first}",
-                   "choices": [{"index": 0, "delta": {},
-                                "finish_reason": "tool_calls" if tcalls else "stop"}],
-                   "fugal": {"meta": meta}})
-        yield b"data: [DONE]\n\n"
-
-        await add_spend(cost, public)
-        print(f"[serve] stream ok  worker={first}  ${cost:.5f}  "
-              f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
-              f"tier={'public' if public else 'full'}", flush=True)
-
-    async def _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id,
-                                temperature=0.0):
-        """Real SSE streaming for the Anthropic Messages wire shape via httpx."""
-        ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
-        first = ranked[0]
-        mid = "msg_" + uuid.uuid4().hex[:24]
-        meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
-                "final_model": first, "cost": 0.0, "steps": [],
-                "input_tokens": 0, "output_tokens": 0}
-
-        lf = chr(10)
-
-        def sse(kind, obj):
-            return ("event: " + kind + lf + "data: " + json.dumps(obj) + lf + lf).encode()
-
-        yield sse("message_start", {"type": "message_start", "message": {
-            "id": mid, "type": "message", "role": "assistant",
-            "model": f"fugal/{first}", "content": [],
-            "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0}}})
-        yield sse("content_block_start", {"type": "content_block_start", "index": 0,
-                                          "content_block": {"type": "text", "text": ""}})
-
-        sys_prompt = compose_system(csys)
-        mtok_val = clamp_max_tokens(mtok)
-        or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
-        key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-        payload = {"model": first, "temperature": temperature, "max_tokens": mtok_val,
-                   "messages": or_msgs, "stream": True,
-                   "stream_options": {"include_usage": True}}
-        if tools:
-            payload["tools"] = tools
-
-        yield sse("ping", {"type": "ping", "fugal": {
-            "stage": "route", "model": first, "p_solve": float(probs[0])}})
-
-        accumulated_tcalls = {}
-        usage = {}
-
-        try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST", OR_URL, json=payload, timeout=180.0,
-                    headers={"Authorization": f"Bearer {key}",
-                             "Content-Type": "application/json"},
-                ) as response:
-                    if response.status_code != 200:
-                        body = (await response.aread()).decode(errors="replace")[:200]
-                        yield sse("content_block_delta", {
-                            "type": "content_block_delta", "index": 0,
-                            "delta": {"type": "text_delta",
-                                      "text": f"[upstream error {response.status_code}: {body}]"}})
-                    else:
                         async for line in response.aiter_lines():
                             line = line.strip()
                             if not line or not line.startswith("data: "):
@@ -709,10 +642,11 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                                 continue
                             delta = choices[0].get("delta", {})
                             if "content" in delta and delta["content"]:
-                                yield sse("content_block_delta", {
-                                    "type": "content_block_delta", "index": 0,
-                                    "delta": {"type": "text_delta",
-                                              "text": delta["content"]}})
+                                yield sse({"id": cid, "object": "chat.completion.chunk",
+                                           "model": f"fugal/{first}",
+                                           "choices": [{"index": 0,
+                                                        "delta": {"content": delta["content"]},
+                                                        "finish_reason": None}]})
                             if "tool_calls" in delta:
                                 for tc in delta["tool_calls"]:
                                     idx = tc.get("index", 0)
@@ -727,49 +661,178 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                                         accumulated_tcalls[idx]["function"]["name"] = fn["name"]
                                     if "arguments" in fn:
                                         accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
-        except Exception as exc:
-            yield sse("content_block_delta", {
-                "type": "content_block_delta", "index": 0,
-                "delta": {"type": "text_delta",
-                          "text": f"\n\n[stream error: {str(exc)[:100]}]"}})
+            except Exception as exc:
+                yield sse({"id": cid, "object": "chat.completion.chunk",
+                           "model": f"fugal/{first}",
+                           "choices": [{"index": 0,
+                                        "delta": {"content": f"\n\n[stream error: {str(exc)[:100]}]"},
+                                        "finish_reason": None}]})
 
-        yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            settle()
 
-        itok = int(usage.get("prompt_tokens", 0))
-        otok = int(usage.get("completion_tokens", 0))
-        cost = f2._price(first, itok, otok)
-        meta["cost"] = cost
-        meta["input_tokens"] = itok
-        meta["output_tokens"] = otok
-        meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+            tcalls = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+            if tcalls:
+                meta["tool_calls"] = tcalls
+                yield sse({"id": cid, "object": "chat.completion.chunk",
+                           "model": f"fugal/{first}",
+                           "choices": [{"index": 0, "delta": {"tool_calls": tcalls},
+                                        "finish_reason": None}]})
 
-        tcalls = openai_calls_to_anthropic(
-            [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)])
-        if tcalls:
-            meta["tool_calls"] = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
-        for i, blk in enumerate(tcalls, start=1):
-            yield sse("content_block_start", {
-                "type": "content_block_start", "index": i,
-                "content_block": {"type": "tool_use", "id": blk["id"],
-                                  "name": blk["name"], "input": {}}})
-            yield sse("content_block_delta", {
-                "type": "content_block_delta", "index": i,
-                "delta": {"type": "input_json_delta",
-                          "partial_json": json.dumps(blk["input"])}})
-            yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+            yield sse({"id": cid, "object": "chat.completion.chunk",
+                       "model": f"fugal/{first}",
+                       "choices": [{"index": 0, "delta": {},
+                                    "finish_reason": "tool_calls" if tcalls else "stop"}],
+                       "fugal": {"meta": meta}})
+            yield b"data: [DONE]\n\n"
+        finally:
+            settle()
 
-        yield sse("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": "tool_use" if tcalls else "end_turn",
-                      "stop_sequence": None},
-            "usage": {"output_tokens": otok},
-            "fugal": meta})
-        yield sse("message_stop", {"type": "message_stop"})
+    async def _stream_anthropic(q, rq, public, hist, tools, msgs, csys, mtok, req_id,
+                                temperature=None):
+        """Real SSE streaming for the Anthropic Messages wire shape via httpx."""
+        ranked, probs = await asyncio.to_thread(
+            f2.route, rq, history=hist if f2.head_context == "multiturn" else None)
+        first = ranked[0]
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
+                "final_model": first, "cost": 0.0, "steps": [],
+                "input_tokens": 0, "output_tokens": 0}
+        accumulated_tcalls = {}
+        usage = {}
+        settled = False
 
-        await add_spend(cost, public)
-        print(f"[serve] anthropic stream ok  worker={first}  "
-              f"${cost:.5f}  hist={len(hist or [])}  "
-              f"tier={'public' if public else 'full'}", flush=True)
+        def settle():
+            # Same contract as _stream_openai's settle(): exactly once, disconnect-safe.
+            nonlocal settled
+            if settled:
+                return
+            settled = True
+            itok = int(usage.get("prompt_tokens", 0))
+            otok = int(usage.get("completion_tokens", 0))
+            cost = f2._price(first, itok, otok)
+            meta["cost"] = cost
+            meta["input_tokens"] = itok
+            meta["output_tokens"] = otok
+            meta["steps"].append({"role": "worker", "model": first, "cost": cost})
+            add_spend(cost, public)
+            print(f"[serve] anthropic stream ok  worker={first}  "
+                  f"${cost:.5f}  hist={len(hist or [])}  "
+                  f"tier={'public' if public else 'full'}", flush=True)
+
+        lf = chr(10)
+
+        def sse(kind, obj):
+            return ("event: " + kind + lf + "data: " + json.dumps(obj) + lf + lf).encode()
+
+        try:
+            yield sse("message_start", {"type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant",
+                "model": f"fugal/{first}", "content": [],
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+            yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                              "content_block": {"type": "text", "text": ""}})
+
+            sys_prompt = compose_system(csys)
+            mtok_val = clamp_max_tokens(mtok)
+            or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
+            key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+            payload = {"model": first, "max_tokens": mtok_val,
+                       "messages": or_msgs, "stream": True,
+                       "stream_options": {"include_usage": True}}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if tools:
+                payload["tools"] = tools
+
+            yield sse("ping", {"type": "ping", "fugal": {
+                "stage": "route", "model": first, "p_solve": float(probs[0])}})
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST", OR_URL, json=payload, timeout=180.0,
+                        headers={"Authorization": f"Bearer {key}",
+                                 "Content-Type": "application/json"},
+                    ) as response:
+                        if response.status_code != 200:
+                            body = (await response.aread()).decode(errors="replace")[:200]
+                            yield sse("content_block_delta", {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "text_delta",
+                                          "text": f"[upstream error {response.status_code}: {body}]"}})
+                        else:
+                            async for line in response.aiter_lines():
+                                line = line.strip()
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
+                                u = chunk.get("usage")
+                                if u:
+                                    usage = u
+                                choices = chunk.get("choices", [])
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {})
+                                if "content" in delta and delta["content"]:
+                                    yield sse("content_block_delta", {
+                                        "type": "content_block_delta", "index": 0,
+                                        "delta": {"type": "text_delta",
+                                                  "text": delta["content"]}})
+                                if "tool_calls" in delta:
+                                    for tc in delta["tool_calls"]:
+                                        idx = tc.get("index", 0)
+                                        if idx not in accumulated_tcalls:
+                                            accumulated_tcalls[idx] = {
+                                                "id": tc.get("id", ""), "type": "function",
+                                                "function": {"name": "", "arguments": ""}}
+                                        if tc.get("id"):
+                                            accumulated_tcalls[idx]["id"] = tc["id"]
+                                        fn = tc.get("function", {})
+                                        if fn.get("name"):
+                                            accumulated_tcalls[idx]["function"]["name"] = fn["name"]
+                                        if "arguments" in fn:
+                                            accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
+            except Exception as exc:
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta",
+                              "text": f"\n\n[stream error: {str(exc)[:100]}]"}})
+
+            yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+            settle()
+
+            tcalls = openai_calls_to_anthropic(
+                [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)])
+            if tcalls:
+                meta["tool_calls"] = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+            for i, blk in enumerate(tcalls, start=1):
+                yield sse("content_block_start", {
+                    "type": "content_block_start", "index": i,
+                    "content_block": {"type": "tool_use", "id": blk["id"],
+                                      "name": blk["name"], "input": {}}})
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": i,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(blk["input"])}})
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
+            yield sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use" if tcalls else "end_turn",
+                          "stop_sequence": None},
+                "usage": {"output_tokens": meta["output_tokens"]},
+                "fugal": meta})
+            yield sse("message_stop", {"type": "message_stop"})
+        finally:
+            settle()
 
     # ---- CORS/Host middleware (raw ASGI) -----------------------------------------
 
@@ -857,7 +920,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     pub = (f"public tier ON: ${daily_cap}/day, {rate_limit}/min/IP"
            if daily_cap is not None else "public tier OFF (token required for answers)")
     print(f"Fugal serving on http://{host}:{port}/v1/chat/completions  [{auth}; {cap}; {pub}]")
-    print(f"  routing among {len(f2.models)} models, lambda={f2.lam:g}")
+    print(f"  routing among {len(f2.models)} models, lambda={f2.lam:g}, "
+          f"head context={f2.head_context}")
     print(f"  browser: CORS {'allowed for ' + ', '.join(sorted(cors)) if cors else 'OFF'}"
           f"; Host check {'ON (' + ', '.join(sorted(hosts_ok)) + ')' if loopback_bind else 'OFF (non-loopback bind)'}")
     if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):
@@ -889,8 +953,9 @@ def main():
                     help="route among a SUBSET of the head's models (also FUGAL_MODELS). "
                          "Exact, not approximate — see docs/HEAD_FORMAT.md.")
     ap.add_argument("--router-lambda", type=float, default=None,
-                    help="override the head's cost sensitivity (higher = prefer cheaper "
-                         "workers on easy queries; unset = the trained default)")
+                    help="override the head's cost sensitivity (also FUGAL_LAMBDA; higher "
+                         "= prefer cheaper workers on easy queries; unset = the trained "
+                         "default)")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--spend-cap", type=float, default=None,

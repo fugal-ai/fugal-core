@@ -1,0 +1,57 @@
+name: Price sync
+
+# The price sheet is the one input that goes stale on its own: providers move prices,
+# and a sheet that lags mis-counts every spend cap (and, with a v2 head, the routing
+# trade-off itself — docs/HEAD_FORMAT.md). This checks weekly and opens a PR when any
+# price moved past refresh_prices.py's default tolerance, so a human still reviews the
+# diff before it lands.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"        # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (numpy only — the script reads the head for its model list)
+        run: pip install -q numpy
+
+      # --check exits 1 on drift. A network failure also exits nonzero, but then the
+      # rewrite step fails on the same fetch and no PR is opened — fail loud, not wrong.
+      - name: Check for drift
+        id: drift
+        run: |
+          if python scripts/refresh_prices.py --check; then
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rewrite the sheet
+        if: steps.drift.outputs.drifted == 'true'
+        run: python scripts/refresh_prices.py
+
+      - name: Open a PR with the new sheet
+        if: steps.drift.outputs.drifted == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "Sync data/models_2026-06.json with OpenRouter"
+          title: "Price sheet drift: re-sync with OpenRouter"
+          body: |
+            `scripts/refresh_prices.py --check` found prices that moved past tolerance.
+            This PR is the output of running the refresh; the diff below is the whole
+            change. Merging keeps `meta.cost`, `X-Fugal-Cost-USD`, and the spend caps
+            counting real dollars (and, with a v2 head, keeps routing costs current).
+          branch: bot/price-sync
+          delete-branch: true

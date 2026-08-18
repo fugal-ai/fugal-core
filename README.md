@@ -121,7 +121,7 @@ page you happened to be visiting could spend your credit from your own machine. 
 ```
 fugal/router.py     the model: backbone -> hidden state -> head -> one worker call
 fugal/serve.py      the CLI and the HTTP server
-data/router_head.npz        the trained head: W, b, models, mean_cost, lam  (73 KB)
+data/router_head.npz        the trained head: W, b, models, costs, lam  (73 KB)
 data/models_2026-06.json    price sheet, USD per million tokens
 docs/HEAD_FORMAT.md         the .npz contract, and the limits of subsetting
 docs/INTEGRATION.md         wiring Fugal into Claude Code / OpenClaw / SDKs
@@ -141,21 +141,29 @@ python verify/verify_head.py            # <1s, no backbone, no network
 python verify/verify_routing.py         # needs the backbone; mocked worker, $0
 ```
 
-Two knobs worth knowing. `--router-lambda` overrides the head's cost sensitivity (shipped:
-`λ=2.0`; higher trades down to cheaper models on easy questions). `FUGAL_MODEL` points at any
+Three things ever need updating, and everything else is code: the **head** (retrain as the
+model landscape changes; forks drop in their own via `data/router_head.npz` or `FUGAL_HEAD`),
+**λ** (`--router-lambda` / `FUGAL_LAMBDA` overrides the head's trained default of 2.0; higher
+trades down to cheaper models on easy questions), and the **price sheet**
+(`scripts/refresh_prices.py` re-syncs it from OpenRouter). `FUGAL_MODEL` points at any
 Qwen3-0.6B checkout if you already have one and want to skip the download.
 
 ## What this does not claim
 
-- The head was fit on **standalone questions**. On a follow-up turn ("now in Rust") the routing
-  signal is weaker than on a fresh question, and the router reads only the latest message.
-- The 17 model ids are a **2026-06 snapshot**, and two different numbers here are made of
-  prices. `mean_cost` inside the head is *routing* input: a measurement taken when the head
-  was fit, deliberately frozen, because `utility = p - λ·mean_cost` has to be evaluated
-  against the costs the head was fit under. `data/models_2026-06.json` is *billing* input:
-  it is what `meta.cost`, `X-Fugal-Cost-USD` and the spend caps are computed from, so it
-  should be current. Run `python scripts/refresh_prices.py` (or `--check`) to keep it that
-  way; a stale sheet means your cap is counting the wrong dollars.
+- The head was fit on **standalone questions**, and it declares that (`context` in the
+  artifact — see `docs/HEAD_FORMAT.md`), so the router reads only the latest *user* turn:
+  never a tool result, and no history, because hidden states from a distribution the head
+  never saw make it route worse, silently. On a follow-up turn ("now in Rust") the routing
+  signal is therefore weaker than on a fresh question. A head retrained on multi-turn
+  transcripts flips this by declaring `context="multiturn"` — no code change.
+- The 17 model ids are a **2026-06 snapshot**, and the shipped head is the **v1 format**: its
+  `mean_cost` bakes in fit-time prices, so routing trades against those until the head is
+  regenerated. The v2 format fixes this by storing measured token counts instead and
+  computing routing cost from the current sheet at load (`docs/HEAD_FORMAT.md`).
+  `data/models_2026-06.json` is *billing* input either way: it is what `meta.cost`,
+  `X-Fugal-Cost-USD` and the spend caps are computed from, so it should be current. Run
+  `python scripts/refresh_prices.py` (or `--check`) to keep it that way; a stale sheet means
+  your cap is counting the wrong dollars.
 - **`ROUTER_SYSTEM_PROMPT` and mean-pooling are part of the trained artifact.** The head was
   fit on hidden states produced under that exact prompt, mean-pooled across all input tokens.
   Changing either silently invalidates the head. Both were chosen via a systematic ablation

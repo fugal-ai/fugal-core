@@ -1,16 +1,26 @@
 # The router head: `data/router_head.npz`
 
-73 KB, five arrays. This is the only trained artifact in the repo; everything else is code.
+73 KB. This is the only trained artifact in the repo; everything else is code. The design
+principle: **everything the routing decision conditions on is declared inside this file**
+— the code reads the declarations and behaves accordingly, so upgrading routing behaviour
+means shipping a new head, never editing code.
 
 ```
-W          (17, 1024)  float32   one independent logistic row per model
-b          (17,)       float32   per-model bias
-models     (17,)       <U29      OpenRouter model ids, index-aligned to W / b / mean_cost
-mean_cost  (17,)       float64   mean USD per query for that model, measured, not quoted
-lam        scalar      float64   cost sensitivity; the shipped head is 2.0
+W                (17, 1024)  float32   one independent logistic row per model
+b                (17,)       float32   per-model bias
+models           (17,)       <U29      OpenRouter model ids, index-aligned to every array
+lam              scalar      float64   cost sensitivity; the shipped head is 2.0
+
+# v2 heads (current format)
+mean_in_tokens   (17,)       float64   mean input tokens per query, measured at fit time
+mean_out_tokens  (17,)       float64   mean output tokens per query, measured at fit time
+context          scalar      str       "standalone" (default when absent) or "multiturn"
+
+# v1 heads (the currently shipped head; supported, with a startup note)
+mean_cost        (17,)       float64   mean USD per query, measured at fit-time PRICES
 ```
 
-Index `i` means the same model in all four arrays. That alignment is the whole contract.
+Index `i` means the same model in every array. That alignment is the whole contract.
 
 ## How it is used
 
@@ -21,10 +31,23 @@ utility = p - lam * mean_cost       # (17,)
 worker = models[argmax(utility)]
 ```
 
+For a **v2 head**, `mean_cost` is computed at load time from the token measurements and the
+CURRENT price sheet: `mean_cost[i] = mean_in_tokens[i]·price_in[i] + mean_out_tokens[i]·price_out[i]`.
+That split is deliberate: how many tokens a query averages is a *measurement*, frozen with
+the head, but what those tokens cost is a *market fact* that moves — so
+`scripts/refresh_prices.py` keeps the routing trade-off itself honest. A v1 head bakes the
+whole `mean_cost` in, which freezes fit-time prices into every routing decision; it still
+works, with a startup note saying so.
+
+`context` declares what transcript distribution the head was fit on. The router feeds
+conversation history into the forward pass **only** for a `"multiturn"` head; a
+`"standalone"` head (the shipped one) routes on the latest user turn alone, because hidden
+states from a distribution the head never saw make it route worse, silently.
+
 `lam` converts dollars into probability points: at `lam=2.0`, a model must be 2 percentage
 points likelier to be right to justify one extra cent per query. Override it at runtime with
-`--router-lambda` or `Fugal(router_lambda=...)` — that changes the decision rule, never the
-stored head.
+`--router-lambda`, `FUGAL_LAMBDA`, or `Fugal(router_lambda=...)` — that changes the decision
+rule, never the stored head.
 
 Inspect the shipped one:
 
@@ -75,8 +98,10 @@ What it actually takes:
 2. Fit a logistic head on `(hidden_state(question) -> solved?)` for that model, using hidden
    states from the **same backbone under the same `ROUTER_SYSTEM_PROMPT`** (see the warning
    below).
-3. Append the row to `W`, its bias to `b`, its id to `models`, and its measured mean cost to
-   `mean_cost`. Save with the same five keys.
+3. Append the row to `W`, its bias to `b`, its id to `models`, and its measured mean token
+   counts to `mean_in_tokens` / `mean_out_tokens` (v2; for a v1 head, its measured mean cost
+   to `mean_cost`). Save with the same keys, and make sure the model has a row in the price
+   sheet — an unpriced model is refused at startup.
 
 Point `FUGAL_HEAD` at your `.npz` to serve it. That work lives in the research repository, not
 here.
@@ -103,3 +128,12 @@ TRINITY dispatcher prompt (p > 0.20). The ablation data is in the research repos
 
 If you fit your own head, use the same prompt and pooling strategy, or rerun the ablation
 under your setup.
+
+## Future direction
+
+Per-model mean token counts are still a per-model *constant* — a one-line question and a
+"write me 3,000 lines" request pay the same routing cost penalty. The theoretically right
+quantity is `E[cost | query, model]`; the input half is already known at routing time (the
+query's own token count), and the output half could become a per-query prediction. Both are
+head-format extensions: when they land they will be new declared arrays here, not code
+changes.

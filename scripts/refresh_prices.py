@@ -7,21 +7,22 @@ refresh_prices.py — bring data/models_2026-06.json back in line with OpenRoute
     python scripts/refresh_prices.py --check    # show the drift, change nothing, exit 1 if any
     python scripts/refresh_prices.py --tolerance 10   # --check only cares about >10% moves
 
-WHY THIS MATTERS MORE THAN IT LOOKS. Two different numbers in this repo are made of prices,
-and only one of them should ever move:
+WHY THIS MATTERS MORE THAN IT LOOKS. This sheet is BILLING input everywhere: Fugal._price()
+multiplies these numbers by real token counts to produce meta["cost"], the X-Fugal-Cost-USD
+header, and the running total that --spend-cap and --daily-cap compare against. When a
+provider moves its price and this file does not, every one of those is quietly wrong, and a
+"cap" that miscounts is worse than no cap.
 
-  mean_cost (in data/router_head.npz)  is ROUTING input. It is a measurement taken when the
-      head was fit, and it is frozen on purpose — `utility = p - lam * mean_cost` has to be
-      evaluated against the same costs the head was fit under. This script never touches it.
+Whether it is ALSO routing input depends on the head format (docs/HEAD_FORMAT.md):
 
-  data/models_2026-06.json             is BILLING input. Fugal._price() multiplies these
-      numbers by real token counts to produce meta["cost"], the X-Fugal-Cost-USD header, and
-      the running total that --spend-cap and --daily-cap compare against. When a provider
-      moves its price and this file does not, every one of those is quietly wrong, and a
-      "cap" that miscounts is worse than no cap.
+  v2 head (mean_in_tokens / mean_out_tokens)  routing cost is computed from this sheet at
+      load time — running this script keeps the routing trade-off itself honest, and the
+      server picks the new numbers up on its next start.
 
-So: the routing trade-off is a fixed historical measurement, the money counter is supposed to
-be current. Run this whenever you care about the second one being true. `git log
+  v1 head (baked-in mean_cost)                routing cost was frozen at fit time and this
+      script never touches it; only billing moves.
+
+Run this whenever you care about the numbers being true. `git log
 data/models_2026-06.json` is the record of when it last ran.
 
 The file name keeps the date of the original snapshot; its CONTENTS are refreshed in place.
@@ -64,10 +65,11 @@ def load_sheet():
 
 
 def head_models():
-    """The head defines which models exist. Import numpy late so --help works without it."""
+    """The head defines which models exist. Import numpy late so --help works without it.
+    Returns (models, is_v2) — a v2 head computes routing cost from the sheet at load."""
     import numpy as np
     z = np.load(HEAD)
-    return [str(m) for m in z["models"]]
+    return [str(m) for m in z["models"]], "mean_in_tokens" in z.files
 
 
 def money(x):
@@ -110,7 +112,7 @@ def main():
                     help="--check only: percent move that counts as drift (default 5)")
     args = ap.parse_args()
 
-    models = head_models()
+    models, head_is_v2 = head_models()
     sheet = load_sheet()
     live = fetch_live()
 
@@ -159,8 +161,12 @@ def main():
         return
     write_sheet(models, new_prices)
     print(f"  wrote {os.path.relpath(PRICES, REPO)} ({len(drifted)} price(s) updated).")
-    print("  mean_cost in the head is UNCHANGED and stays that way — it is routing input, "
-          "not billing input.")
+    if head_is_v2:
+        print("  v2 head: routing costs are computed from this sheet at load — a running "
+              "server picks the new numbers up on its next start.")
+    else:
+        print("  v1 head: its baked-in mean_cost is UNCHANGED — routing still trades "
+              "against fit-time prices; only billing moved (see docs/HEAD_FORMAT.md).")
 
 
 if __name__ == "__main__":

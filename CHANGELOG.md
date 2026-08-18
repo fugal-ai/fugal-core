@@ -12,6 +12,50 @@ version here. Head changes are called out explicitly under their release.
 
 ### Changed
 
+- **Head format v2: routing costs come from the current price sheet.** The `.npz` head may
+  now carry `mean_in_tokens` / `mean_out_tokens` (frozen fit-time measurements) instead of a
+  baked-in `mean_cost`; `load_head()` computes `mean_cost` from the current
+  `data/models_2026-06.json` at load, so `scripts/refresh_prices.py` keeps the routing
+  trade-off itself honest, not just billing. v1 heads (including the shipped one) still
+  work, with a startup note that their routing costs are frozen at fit time. The head may
+  also declare `context` (`"standalone"`, the default, or `"multiturn"`). See
+  `docs/HEAD_FORMAT.md`.
+- **The router reads the latest user turn — never a tool result, and history only when the
+  head declares it can use it.** Previously the router was fed conversation history (which
+  the standalone-question head never saw at fit time, an undocumented distribution shift)
+  and, mid tool loop, the last message — a tool *result* the head cannot score. Routing now
+  targets the latest user text turn, which also makes a whole tool loop deterministic:
+  same turn, same hidden state, same worker. Heads with `context="multiturn"` get history
+  automatically.
+- **`temperature` is omitted when the caller sent none**, so each worker keeps its own
+  provider default instead of inheriting `0.0` from the proxy. A caller-supplied value is
+  passed through unchanged.
+- **`FUGAL_LAMBDA`** environment variable overrides the head's cost sensitivity, for parity
+  with `--router-lambda` (precedence: argument, then env, then the head's trained default).
+- **OpenAI content parts accepted.** List-shaped `content` (typed text parts) is flattened
+  in the query, the history, and system-role messages instead of being rejected or dropped.
+- `Fugal.__init__` factored into pure `load_prices()` / `load_head()` functions, unit-tested
+  without torch.
+
+### Fixed
+
+- **Unpriced models are refused at startup** instead of billed at an invented fallback rate
+  (`1e-6/3e-6` per token), which silently mis-counted `meta.cost`, `X-Fugal-Cost-USD`, and
+  every spend cap for that model. Exclude a model with `--models` or re-sync the sheet.
+- **Streamed spend is settled even when the client disconnects mid-stream.** The accounting
+  ran only after a completed stream, so a dropped connection spent OpenRouter credit that
+  never counted against `--spend-cap` / `--daily-cap`. Both stream generators now settle
+  exactly once, in a `finally`. (The usage totals arrive in the upstream's final chunk, so a
+  very early disconnect can still under-count; the OpenRouter key's hard limit remains the
+  outermost brake.)
+- `verify_head.py`'s lambda check was a tautology (`|λ·0.01 − λ·0.01| < 1e-12`, unfailable);
+  it now asserts the decision itself — the winner flips exactly where the p-gap crosses
+  `λ × Δcost`.
+- Doc drift: README / `docs/INTEGRATION.md` / `answer_iter` claimed the router "reads only
+  the latest message" while the code passed history, and INTEGRATION.md still said
+  temperature was fixed at 0.0. Docs and behaviour now agree (and the behaviour is the
+  head-declared one above).
+
 - **Async server rewrite.** `ThreadingHTTPServer` replaced with Starlette + uvicorn. Real
   SSE streaming from OpenRouter via httpx — clients see tokens as they arrive instead of
   receiving a buffered response. The torch forward pass runs in `asyncio.to_thread()` so it
@@ -19,7 +63,8 @@ version here. Head changes are called out explicitly under their release.
   middleware layer. All endpoints, auth, spend caps, and rate limiting unchanged.
 - **Client temperature honoured.** The `temperature` field from client requests is now
   passed through to the worker model. Previously every call used `temperature=0.0`
-  regardless of what the client asked for. Default remains 0.0 when absent.
+  regardless of what the client asked for. (When absent it is omitted entirely — see the
+  entry above.)
 - **Single HTTP client.** `requests` replaced by `httpx` in `or_request()`, which was
   the only call site. The project now uses `httpx` for both sync worker calls and async
   streaming — one fewer dependency.
@@ -31,12 +76,16 @@ version here. Head changes are called out explicitly under their release.
 - File handle leak in `Fugal.__init__` (`json.load(open(...))` → `with` statement).
 - Non-transient OpenRouter errors no longer waste retries (raised as `ValueError` with
   immediate re-raise instead of `RuntimeError` caught by the retry loop).
-- Constructor now warns when a head model has no price entry.
+- Constructor now refuses to start when a head model has no price entry (was briefly a
+  warning; see the unpriced-models entry above for why it must be fatal).
 
 ### Added
 
-- `tests/test_router_math.py` — 7 unit tests covering sigmoid, L2 normalization,
-  independent rows, lambda monotonicity, and price calculation.
+- `tests/test_router_math.py` — unit tests covering sigmoid, L2 normalization,
+  independent rows, lambda monotonicity, price calculation, and `load_head()` (both head
+  formats, unpriced refusal, lambda resolution order, subsetting).
+- `.github/workflows/prices.yml` — weekly scheduled check of the price sheet against
+  OpenRouter; opens a PR with the refreshed sheet when drift exceeds tolerance.
 
 ### Removed
 

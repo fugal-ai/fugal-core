@@ -69,6 +69,11 @@ One local forward pass per question, roughly 1–2 s each on a CPU core, no API 
 `--cache` stores the hidden states so re-running at a different `--router-lambda` is
 instant — which is the cheapest way to see how much the cost term actually costs you.
 
+With a **v2 head** (docs/HEAD_FORMAT.md) the routing costs are computed from the current
+price sheet at load, so record which sheet you evaluated under (`git log
+data/models_2026-06.json`) alongside the numbers — re-running after a price refresh can
+legitimately change the routed cost column.
+
 ## Reading the output
 
 **Per model — AUC and Brier.** AUC asks whether `p_solve` *ranks* correctly: given one

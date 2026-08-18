@@ -15,12 +15,14 @@ says how to produce one. Passing this file means the artifact is well-formed and
 decision rule behaves as documented, not that the artifact is any good.
 
 Checks:
-  1. the five-array contract and index alignment (docs/HEAD_FORMAT.md)
-  2. every model the head scores has a price in the sheet
+  1. the array contract and index alignment, v1 or v2 (docs/HEAD_FORMAT.md)
+  2. every model the head scores has a price in the sheet (fatal for a v2 head,
+     whose routing costs are COMPUTED from the sheet)
   3. the head is non-degenerate — not a placeholder, not duplicated rows
   4. p_solve is a probability for any input, with no NaN/overflow
   5. SUBSETTING IS EXACT: dropping rows leaves the remaining scores bit-identical
-  6. lambda means what the docs say: utility trades `lam` probability per dollar
+  6. lambda means what the docs say: a model one cent dearer per query must be
+     lam x $0.01 likelier to be right, and the winner flips exactly there
   7. raising lambda never promotes a more expensive model over a cheaper one
 """
 import io
@@ -57,31 +59,53 @@ def sigmoid(x):
 print("\n  head properties (pure numpy — no backbone, no network, $0)\n")
 
 z = np.load(HEAD)
+files = set(z.files)
+v2 = "mean_in_tokens" in files
 
-# --- 1. the contract -------------------------------------------------------------
-check("five arrays present", set(z.files) == {"W", "b", "models", "mean_cost", "lam"},
-      f"got {sorted(z.files)}")
-W, b, mean_cost = z["W"], z["b"], z["mean_cost"]
+# --- 1. the contract (v1 or v2 — docs/HEAD_FORMAT.md) ------------------------------
+check("required arrays present",
+      {"W", "b", "models", "lam"}.issubset(files)
+      and ("mean_cost" in files or {"mean_in_tokens", "mean_out_tokens"}.issubset(files)),
+      f"got {sorted(files)}")
+W, b = z["W"], z["b"]
 models = [str(m) for m in z["models"]]
 lam = float(z["lam"])
 n = len(models)
+context = str(z["context"]) if "context" in files else "standalone"
+check("context is a known value", context in ("standalone", "multiturn"),
+      f"context={context!r}")
 
-check(f"shapes align at n={n}",
-      W.shape == (n, 1024) and b.shape == (n,) and mean_cost.shape == (n,),
+# --- 2. every scored model can be billed -------------------------------------------
+# Unpriced is fatal at runtime: load_head refuses to start (a made-up rate would
+# corrupt cost reporting and every spend cap), and a v2 head cannot even compute
+# its routing costs without the sheet.
+with io.open(PRICES, encoding="utf-8") as f:
+    sheet = {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in json.load(f)}
+unpriced = [m for m in models if m not in sheet]
+check("every model has a price", not unpriced, f"unpriced: {unpriced}")
+
+if v2:
+    itok, otok = z["mean_in_tokens"], z["mean_out_tokens"]
+    check("token stats are positive and finite",
+          bool(np.all(np.isfinite(itok)) and np.all(np.isfinite(otok))
+               and np.all(itok > 0) and np.all(otok > 0)))
+    nanp = (float("nan"), float("nan"))
+    pin = np.array([sheet.get(m, nanp)[0] for m in models])
+    pout = np.array([sheet.get(m, nanp)[1] for m in models])
+    mean_cost = itok * pin + otok * pout        # what load_head computes at runtime
+else:
+    mean_cost = z["mean_cost"]
+
+shapes_ok = W.shape == (n, 1024) and b.shape == (n,) and mean_cost.shape == (n,)
+if v2:
+    shapes_ok = shapes_ok and itok.shape == (n,) and otok.shape == (n,)
+check(f"shapes align at n={n} ({'v2' if v2 else 'v1'} head)", shapes_ok,
       f"W{W.shape} b{b.shape} mean_cost{mean_cost.shape}")
 check("model ids are unique", len(set(models)) == n)
 check("mean_cost is positive and finite",
       bool(np.all(np.isfinite(mean_cost)) and np.all(mean_cost > 0)))
 check("lam is positive and finite", np.isfinite(lam) and lam > 0, f"lam={lam}")
 check("W and b are finite", bool(np.all(np.isfinite(W)) and np.all(np.isfinite(b))))
-
-# --- 2. every scored model can be billed -----------------------------------------
-with io.open(PRICES, encoding="utf-8") as f:
-    priced = {m["id"] for m in json.load(f)}
-unpriced = [m for m in models if m not in priced]
-# Unpriced is not cosmetic: Fugal._price() falls back to a made-up rate, so cost
-# reporting and every spend cap silently drift for that model.
-check("every model has a price", not unpriced, f"unpriced: {unpriced}")
 
 # --- 3. non-degenerate -----------------------------------------------------------
 # A placeholder artifact (zeros, one row tiled n times, uninitialised noise) would pass
@@ -142,11 +166,17 @@ check("subsetting never reorders the surviving models", not rank_breaks,
 
 # --- 6. lambda means what HEAD_FORMAT.md says ------------------------------------
 # "at lam=2.0, a model must be 2 percentage points likelier to be right to justify one
-# extra cent per query". That is just lam * $0.01 — assert it rather than trusting prose.
-one_cent_in_prob_points = lam * 0.01
-check(f"one extra cent costs {one_cent_in_prob_points * 100:.3g} probability points at "
-      f"lam={lam:g}",
-      abs(one_cent_in_prob_points - lam * 0.01) < 1e-12)
+# extra cent per query". Assert the DECISION, not the arithmetic: two models one cent
+# apart in cost, with a p gap just below and just above lam*0.01 — the winner must
+# flip exactly at that boundary.
+gap = lam * 0.01
+two_costs = np.array([0.0, 0.01])
+p_below = np.array([0.5, 0.5 + gap * 0.999])
+p_above = np.array([0.5, 0.5 + gap * 1.001])
+check(f"one extra cent per query demands {gap * 100:.3g} extra probability points at "
+      f"lam={lam:g}, no more, no less",
+      int(np.argmax(p_below - lam * two_costs)) == 0
+      and int(np.argmax(p_above - lam * two_costs)) == 1)
 
 # --- 7. lambda is monotone in cost -----------------------------------------------
 # Raising lambda may only ever shift preference toward CHEAPER models. If a higher lambda

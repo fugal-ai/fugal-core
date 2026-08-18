@@ -18,7 +18,8 @@ import unittest
 
 from fugal.serve import (anthropic_response, anthropic_text, anthropic_to_body,
                          anthropic_tools_to_openai, clean_history,
-                         client_system_from_body, openai_calls_to_anthropic)
+                         client_system_from_body, openai_calls_to_anthropic,
+                         routing_query)
 from fugal.router import WORKER_SYSTEM_PROMPT, clamp_max_tokens, compose_system
 
 
@@ -72,8 +73,14 @@ class TestClientSystemFromBody(unittest.TestCase):
         self.assertEqual(client_system_from_body({"messages": []}), "")
         self.assertEqual(client_system_from_body({}), "")
 
-    def test_non_string_system_content_is_ignored(self):
+    def test_list_system_content_is_flattened(self):
+        # OpenAI content parts share Anthropic's {"type":"text"} block shape, so a
+        # parts-shaped system prompt is flattened rather than silently dropped.
         body = {"messages": [{"role": "system", "content": [{"type": "text", "text": "x"}]}]}
+        self.assertEqual(client_system_from_body(body), "x")
+
+    def test_non_text_system_content_is_ignored(self):
+        body = {"messages": [{"role": "system", "content": 42}]}
         self.assertEqual(client_system_from_body(body), "")
 
 
@@ -277,6 +284,15 @@ class TestCleanHistory(unittest.TestCase):
                              {"role": "user", "content": "q"}]}
         self.assertEqual(len(clean_history(body)[0]["content"]), 8000)
 
+    def test_list_content_is_flattened_not_dropped(self):
+        # OpenAI clients commonly send content as an array of typed parts.
+        body = {"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "part one"},
+                                         {"type": "image_url", "image_url": {"url": "x"}}]},
+            {"role": "user", "content": "q"}]}
+        self.assertEqual(clean_history(body),
+                         [{"role": "user", "content": "part one"}])
+
     def test_non_conversational_turns_are_dropped(self):
         body = {"messages": [{"role": "system", "content": "s"},
                              {"role": "tool", "tool_call_id": "t", "content": "r"},
@@ -290,6 +306,42 @@ class TestCleanHistory(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(clean_history({}), [])
         self.assertEqual(clean_history({"messages": []}), [])
+
+
+class TestRoutingQuery(unittest.TestCase):
+    """What the router reads: the latest USER text turn — never a tool result."""
+
+    def test_plain_chat_routes_on_the_last_user_turn(self):
+        msgs = [{"role": "user", "content": "old"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "new question"}]
+        self.assertEqual(routing_query(msgs), "new question")
+
+    def test_tool_loop_routes_on_the_originating_user_turn(self):
+        # THE case this exists for: mid tool loop the last message is a tool RESULT,
+        # which the head cannot score. Routing on the user turn instead is also what
+        # keeps one model on the whole loop — same turn, same hidden state, same worker.
+        msgs = [{"role": "user", "content": "list my repo files and summarise"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "ls", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "bin  etc  src"}]
+        self.assertEqual(routing_query(msgs), "list my repo files and summarise")
+
+    def test_content_parts_are_flattened(self):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "from parts"}]}]
+        self.assertEqual(routing_query(msgs), "from parts")
+
+    def test_assistant_text_is_never_routed_on(self):
+        msgs = [{"role": "user", "content": "q"},
+                {"role": "assistant", "content": "assistant text"}]
+        self.assertEqual(routing_query(msgs), "q")
+
+    def test_fallback_when_no_user_text(self):
+        self.assertEqual(routing_query([], fallback="fb"), "fb")
+        self.assertEqual(routing_query(None, fallback="fb"), "fb")
+        self.assertEqual(routing_query(
+            [{"role": "tool", "tool_call_id": "c", "content": "r"}], fallback="fb"), "fb")
 
 
 if __name__ == "__main__":

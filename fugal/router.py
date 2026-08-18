@@ -18,6 +18,12 @@ SUBSET of the models for free (see `models=` / FUGAL_MODELS below): dropping a
 row cannot disturb the others. Adding a NEW model cannot be done here — that
 needs evidence for that model. See docs/HEAD_FORMAT.md.
 
+Everything the routing decision conditions on is declared INSIDE the head artifact,
+never hardcoded here: a v2 head carries per-model token statistics (so mean_cost is
+computed from the CURRENT price sheet at load) and a `context` flag saying what
+transcript distribution it was fit on (standalone questions vs multi-turn). The code
+reads those declarations; upgrading routing behaviour means shipping a new head.
+
 Serving (OpenAI + Anthropic wire shapes), the CLI, and the spend controls live in
 serve.py. This file is the model.
 
@@ -140,7 +146,7 @@ class FugalRouter:
 _RETRYABLE = {408, 409, 429, 500, 502, 503, 504}
 
 
-def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, retries=3,
+def or_request(model, messages, max_tokens=4096, temperature=None, timeout=180, retries=3,
                tools=None, tool_choice=None):
     """One OpenRouter chat call, returning the RAW assistant message plus token usage.
 
@@ -149,13 +155,19 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
     OpenRouter relays both to the underlying model - there is nothing to implement here,
     only fields to stop discarding.
 
+    `temperature=None` means the field is OMITTED, so each worker keeps its provider's
+    own default. A value is only ever sent when the caller actually asked for one —
+    routing to a different model per message is no reason to override every model's
+    sampling defaults with an opinion of ours.
+
     Returns (message_dict, prompt_tokens, completion_tokens). The message may carry
     `content`, `tool_calls`, or both.
     """
     import httpx
     key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-    payload = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
-               "messages": messages}
+    payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if temperature is not None:
+        payload["temperature"] = temperature
     if tools:
         payload["tools"] = tools
         if tool_choice is not None:
@@ -186,7 +198,7 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
     raise last if last else RuntimeError("or_request failed")
 
 
-def or_call(model, prompt, max_tokens=4096, temperature=0.0, timeout=180, retries=3,
+def or_call(model, prompt, max_tokens=4096, temperature=None, timeout=180, retries=3,
             history=None, system=None):
     """Text-only wrapper over or_request. Kept at its original 3-tuple RETURN contract
     because several call sites and the mock in verify/ depend on that shape - the tool path
@@ -200,6 +212,86 @@ def or_call(model, prompt, max_tokens=4096, temperature=0.0, timeout=180, retrie
     return text, itok, otok
 
 
+# ---- loading the trained artifact ---------------------------------------------
+def load_prices(path):
+    """data/models_*.json -> {model_id: (usd_per_input_token, usd_per_output_token)}."""
+    with open(path) as f:
+        return {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in json.load(f)}
+
+
+def load_head(head_path, prices, models=None, router_lambda=None):
+    """The .npz head -> (models, W, b, mean_cost, lam, context). Pure numpy, no torch.
+
+    Two head formats (docs/HEAD_FORMAT.md):
+      v2 carries mean_in_tokens / mean_out_tokens — frozen MEASUREMENTS of how many
+         tokens a query for each model averaged at fit time — and mean_cost is computed
+         here from the CURRENT price sheet, so refresh_prices.py keeps routing honest.
+      v1 carries a baked-in mean_cost, which freezes fit-time prices into every routing
+         decision. Supported, with a note, until a v2 head replaces it.
+
+    `context` declares what transcript distribution the head was fit on ("standalone"
+    questions, the default, or "multiturn"); the caller feeds the router history only
+    when the head says it can use it.
+
+    lam resolution order: the router_lambda argument, then FUGAL_LAMBDA, then the
+    head's trained default. A model with no entry in the price sheet is a hard error:
+    inventing a rate would silently corrupt every cost report and spend cap.
+    """
+    if not os.path.exists(head_path):
+        raise SystemExit(
+            f"router head missing: {head_path}\n"
+            f"  Expected data/router_head.npz, or set FUGAL_HEAD to your own "
+            f"(format: docs/HEAD_FORMAT.md).")
+    z = np.load(head_path)
+    all_models = [str(m) for m in z["models"]]
+
+    sel = models if models is not None else os.environ.get("FUGAL_MODELS")
+    if isinstance(sel, str):
+        sel = [s.strip() for s in sel.split(",") if s.strip()]
+    if sel:
+        unknown = [m for m in sel if m not in all_models]
+        if unknown:
+            raise SystemExit(
+                f"unknown model(s) for this head: {', '.join(unknown)}\n"
+                f"  The head scores exactly these {len(all_models)}:\n    "
+                + "\n    ".join(all_models)
+                + "\n  Routing to a model the head was not fit on is not possible; "
+                  "see docs/HEAD_FORMAT.md.")
+        idx = [all_models.index(m) for m in sel]
+    else:
+        idx = list(range(len(all_models)))
+    out_models = [all_models[i] for i in idx]
+
+    unpriced = [m for m in out_models if m not in prices]
+    if unpriced:
+        raise SystemExit(
+            f"no price for: {', '.join(unpriced)}\n"
+            f"  Every routed model must be billable, or cost reports and spend caps lie.\n"
+            f"  Run `python scripts/refresh_prices.py` to re-sync the sheet, or exclude "
+            f"the model(s) with --models / FUGAL_MODELS.")
+
+    if "mean_in_tokens" in z.files:
+        itok, otok = z["mean_in_tokens"][idx], z["mean_out_tokens"][idx]
+        pin = np.array([prices[m][0] for m in out_models])
+        pout = np.array([prices[m][1] for m in out_models])
+        mean_cost = itok * pin + otok * pout
+    else:
+        mean_cost = z["mean_cost"][idx]
+        # ASCII on purpose: load_head runs in library contexts where stdout may not be
+        # UTF-8 (use_utf8() is an entry-point-only affordance).
+        print("  note: v1 head - routing costs are frozen at fit time; a v2 head "
+              "(docs/HEAD_FORMAT.md) computes them from the current price sheet")
+
+    if router_lambda is not None:
+        lam = float(router_lambda)
+    elif os.environ.get("FUGAL_LAMBDA"):
+        lam = float(os.environ["FUGAL_LAMBDA"])
+    else:
+        lam = float(z["lam"])
+    context = str(z["context"]) if "context" in z.files else "standalone"
+    return out_models, z["W"][idx], z["b"][idx], mean_cost, lam, context
+
+
 # ---- the router: hidden state -> which model answers -------------------------
 class Fugal:
     """Route once, call one model, return its answer.
@@ -208,44 +300,15 @@ class Fugal:
         to a comma-separated list). Use this when you only hold keys for some providers.
         Each row of W is an independent logistic head, so a subset is exact, not an
         approximation — the remaining models score exactly as they would have.
-    router_lambda: override the head's cost sensitivity. Higher => trade down to cheaper
-        workers on easy queries. None keeps the trained default.
+    router_lambda: override the head's cost sensitivity (also FUGAL_LAMBDA). Higher =>
+        trade down to cheaper workers on easy queries. None keeps the trained default.
     """
 
     def __init__(self, models=None, router_lambda=None):
-        if not os.path.exists(HEAD):
-            raise SystemExit(
-                f"router head missing: {HEAD}\n"
-                f"  Expected data/router_head.npz, or set FUGAL_HEAD to your own "
-                f"(format: docs/HEAD_FORMAT.md).")
-        z = np.load(HEAD)
-        all_models = [str(m) for m in z["models"]]
-
-        sel = models if models is not None else os.environ.get("FUGAL_MODELS")
-        if isinstance(sel, str):
-            sel = [s.strip() for s in sel.split(",") if s.strip()]
-        if sel:
-            unknown = [m for m in sel if m not in all_models]
-            if unknown:
-                raise SystemExit(
-                    f"unknown model(s) for this head: {', '.join(unknown)}\n"
-                    f"  The head scores exactly these {len(all_models)}:\n    "
-                    + "\n    ".join(all_models)
-                    + "\n  Routing to a model the head was not fit on is not possible; "
-                      "see docs/HEAD_FORMAT.md.")
-            idx = [all_models.index(m) for m in sel]
-        else:
-            idx = list(range(len(all_models)))
-
-        self.models = [all_models[i] for i in idx]
-        self.W, self.b, self.mean_cost = z["W"][idx], z["b"][idx], z["mean_cost"][idx]
-        self.lam = float(z["lam"]) if router_lambda is None else float(router_lambda)
-        with open(PRICES) as f:
-            self.prices = {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in json.load(f)}
-        unpriced = [m for m in self.models if m not in self.prices]
-        if unpriced:
-            import warnings
-            warnings.warn(f"no price for {unpriced}; cost reporting will be wrong")
+        self.prices = load_prices(PRICES)
+        (self.models, self.W, self.b, self.mean_cost,
+         self.lam, self.head_context) = load_head(HEAD, self.prices, models=models,
+                                                  router_lambda=router_lambda)
         mdir = os.environ["FUGAL_MODEL"]
         if not os.path.isdir(mdir):
             raise SystemExit(
@@ -256,15 +319,17 @@ class Fugal:
         self._rlock = threading.Lock()      # torch forward is not thread-safe
 
     def _price(self, model, itok, otok):
-        pin, pout = self.prices.get(model, (1e-6, 3e-6))
+        # No fallback: load_head refuses to start with an unpriced model, so a miss
+        # here is a bug, not a condition to paper over with an invented rate.
+        pin, pout = self.prices[model]
         return itok * pin + otok * pout
 
     def route(self, query, history=None):
         """query -> (models ranked best-first, their p_solve in the same order).
-        When history is provided the backbone sees the full conversation, so
-        follow-up turns like "now in Rust" route on the actual task context
-        rather than the bare follow-up string alone.  The head will need
-        retraining on multi-turn hidden states to fully benefit from this."""
+        Pass history ONLY for a head fit on multi-turn transcripts (head_context ==
+        "multiturn"); the shipped head was fit on standalone questions, and feeding
+        it hidden states from a distribution it never saw routes worse, silently.
+        answer_iter and the server gate this on the head's own declaration."""
         msgs = [{"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                 *(history or []),
                 {"role": "user", "content": query}]
@@ -277,12 +342,16 @@ class Fugal:
         return [self.models[i] for i in order], p[order]
 
     def answer_iter(self, query, history=None, tools=None, messages=None, system=None,
-                    max_tokens=None, temperature=0.0):
+                    max_tokens=None, temperature=None, route_on=None):
         """Route once and answer, yielding one event per stage as it happens.
         The last event is {"stage":"final","content":...,"meta":...}. This is the
         single source of truth: answer() and the streaming server both consume it.
-        `history` = prior {role, content} turns; the router routes on the latest
-        query alone (what the head was fit on), the worker sees history.
+        `history` = prior {role, content} turns; the WORKER always sees it, the
+        ROUTER sees it only if the head declares it was fit on multi-turn
+        transcripts (head_context) — otherwise it routes on `route_on` alone.
+        `route_on` = what the router reads, when it differs from the worker query:
+        on a tool-loop continuation the last message is a tool RESULT, which the
+        head cannot score, so the server passes the originating user turn instead.
         `system` = the caller's own system prompt; it is merged AFTER the house
         prompt (compose_system) so every model shares one identity and format."""
         # in/out token totals are accumulated alongside cost so the Anthropic-shaped
@@ -290,7 +359,9 @@ class Fugal:
         sys_prompt = compose_system(system)
         mtok = clamp_max_tokens(max_tokens)
         meta = {"cost": 0.0, "steps": [], "input_tokens": 0, "output_tokens": 0}
-        ranked, probs = self.route(query, history=history)
+        ranked, probs = self.route(
+            route_on or query,
+            history=history if self.head_context == "multiturn" else None)
         first = ranked[0]
         meta["p_solve"] = float(probs[0])          # router confidence in the chosen worker
         meta["ranked"] = list(ranked[:3])
@@ -329,11 +400,11 @@ class Fugal:
         yield {"stage": "final", "content": reply, "meta": meta}
 
     def answer(self, query, verbose=False, history=None, tools=None, messages=None,
-               system=None, max_tokens=None, temperature=0.0):
+               system=None, max_tokens=None, temperature=None, route_on=None):
         reply, meta = None, None
         for ev in self.answer_iter(query, history=history, tools=tools, messages=messages,
                                    system=system, max_tokens=max_tokens,
-                                   temperature=temperature):
+                                   temperature=temperature, route_on=route_on):
             if verbose and ev["stage"] == "route":
                 alts = ", ".join(ev["alternatives"])
                 print(f"  router: {ev['model']} (p_solve={ev['p_solve']:.2f}; next: {alts})")

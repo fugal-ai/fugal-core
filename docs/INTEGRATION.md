@@ -212,9 +212,18 @@ remember that the outermost spend brake is the hard limit on the OpenRouter key 
   public tier. Requests that carry `tools` bypass this — the full message list is forwarded
   verbatim so tool_call_id linkage survives. Agent harnesses therefore keep full context;
   long *non-tool* chats get truncated from the oldest end.
-- **Routing reads the last message only.** The head was fit on standalone questions, so on
-  a follow-up (or a tool-result turn) the routing signal is weaker than on a fresh question.
-- **`temperature` is fixed at 0.0** and the caller's value is ignored.
+- **Routing reads the latest *user* turn.** Never a tool result and never history — the
+  shipped head declares it was fit on standalone questions (`context` in the artifact, see
+  `docs/HEAD_FORMAT.md`), and feeding it anything else makes it route worse, silently. Two
+  consequences worth knowing: a whole tool loop routes on the user turn that started it, so
+  one model handles the loop end to end; and on a follow-up turn ("now in Rust") the routing
+  signal is weaker than on a fresh question. A head retrained on multi-turn transcripts
+  declares `context="multiturn"` and gets history automatically.
+- **`temperature` is passed through when the caller sends one**, and omitted otherwise so
+  each worker keeps its own provider default.
+- **Streamed spend is settled even if the client disconnects mid-stream**, but the token
+  usage arrives in the upstream's final chunk, so a very early disconnect can under-count.
+  The hard limit on the OpenRouter key itself is the outermost brake.
 - **Reported cost is only as good as the price sheet.** `X-Fugal-Cost-USD`, the `fugal.cost`
   field and the spend caps are all computed from `data/models_2026-06.json`. Providers move
   their prices; `python scripts/refresh_prices.py` re-syncs it, and `--check` reports drift
