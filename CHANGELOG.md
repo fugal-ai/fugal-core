@@ -17,7 +17,13 @@ version here. Head changes are called out explicitly under their release.
   receiving a buffered response. The torch forward pass runs in `asyncio.to_thread()` so it
   never blocks the event loop. CORS and Host-rebinding checks moved to a clean ASGI
   middleware layer. All endpoints, auth, spend caps, and rate limiting unchanged.
-- New dependencies: `starlette`, `uvicorn`, `httpx`.
+- **Client temperature honoured.** The `temperature` field from client requests is now
+  passed through to the worker model. Previously every call used `temperature=0.0`
+  regardless of what the client asked for. Default remains 0.0 when absent.
+- **Single HTTP client.** `requests` replaced by `httpx` in `or_request()`, which was
+  the only call site. The project now uses `httpx` for both sync worker calls and async
+  streaming — one fewer dependency.
+- New dependencies: `starlette`, `uvicorn`, `httpx`. Removed: `requests`.
 - CI Actions bumped: `actions/checkout@v7`, `actions/setup-python@v7`, `actions/cache@v6`.
 
 ### Fixed
@@ -43,6 +49,11 @@ version here. Head changes are called out explicitly under their release.
 
 ### Security
 
+- **`allow_pickle=True` removed from all `.npz` loads.** The head's `models` array is
+  `<U29` (fixed-width Unicode), which does not need pickle — verified on the shipped head.
+  `allow_pickle=True` on untrusted `.npz` files is a remote code execution vector; in the
+  Bittensor subnet context (validators loading miner-submitted heads), this was the one
+  thing standing between the head-loading pipeline and safe operation.
 - **Browsers can no longer reach the server by default.** CORS headers used to be sent for
   whatever `Origin` arrived, and the documented way to run Fugal is on localhost with no
   token and a live OpenRouter key — so any page a user visited could spend their credit

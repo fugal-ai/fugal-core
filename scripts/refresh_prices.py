@@ -66,7 +66,7 @@ def load_sheet():
 def head_models():
     """The head defines which models exist. Import numpy late so --help works without it."""
     import numpy as np
-    z = np.load(HEAD, allow_pickle=True)
+    z = np.load(HEAD)
     return [str(m) for m in z["models"]]
 
 

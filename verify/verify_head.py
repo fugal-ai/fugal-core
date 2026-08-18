@@ -56,7 +56,7 @@ def sigmoid(x):
 
 print("\n  head properties (pure numpy — no backbone, no network, $0)\n")
 
-z = np.load(HEAD, allow_pickle=True)
+z = np.load(HEAD)
 
 # --- 1. the contract -------------------------------------------------------------
 check("five arrays present", set(z.files) == {"W", "b", "models", "mean_cost", "lam"},

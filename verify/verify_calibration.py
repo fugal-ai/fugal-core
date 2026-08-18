@@ -138,7 +138,7 @@ def main():
     # --- hidden states -> p_solve -------------------------------------------------
     cache_ok = args.cache and os.path.exists(args.cache)
     if cache_ok:
-        cz = np.load(args.cache, allow_pickle=True)
+        cz = np.load(args.cache)
         H = cz["H"]
         if len(H) != len(rows) or list(cz["questions"]) != [q for q, _ in rows]:
             sys.exit(f"{args.cache} does not match this fixture; delete it and re-run.")

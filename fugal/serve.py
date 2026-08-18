@@ -337,6 +337,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             body = anthropic_to_body(raw)
             body["stream"] = bool(raw.get("stream"))
             body["max_tokens"] = raw.get("max_tokens")
+            body["temperature"] = raw.get("temperature")
             if raw.get("tools"):
                 body["tools"] = anthropic_tools_to_openai(raw.get("tools"))
         else:
@@ -444,21 +445,27 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         msgs = body.get("messages") if tools else None
         csys = client_system_from_body(body)
         mtok = body.get("max_tokens")
+        try:
+            temp = float(body.get("temperature", 0.0))
+        except (TypeError, ValueError):
+            temp = 0.0
 
         if body.get("stream"):
             if anthropic:
                 return StreamingResponse(
-                    _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id),
+                    _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id,
+                                      temperature=temp),
                     media_type="text/event-stream",
                     headers={"cache-control": "no-cache", "connection": "close"})
             return StreamingResponse(
-                _stream_openai(q, public, hist, tools, msgs, csys, mtok),
+                _stream_openai(q, public, hist, tools, msgs, csys, mtok,
+                               temperature=temp),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache", "connection": "close"})
 
         reply, meta = await asyncio.to_thread(
             f2.answer, q, history=hist, tools=tools, messages=msgs,
-            system=csys, max_tokens=mtok)
+            system=csys, max_tokens=mtok, temperature=temp)
         await add_spend(meta["cost"], public)
 
         extra = {"x-fugal-cost-usd": f"{meta['cost']:.6f}"}
@@ -503,7 +510,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
 
     # ---- real streaming ----------------------------------------------------------
 
-    async def _stream_openai(q, public, hist, tools, msgs, csys, mtok):
+    async def _stream_openai(q, public, hist, tools, msgs, csys, mtok, temperature=0.0):
         """Real SSE streaming for the OpenAI wire shape via httpx."""
         ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
         first = ranked[0]
@@ -527,7 +534,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         mtok_val = clamp_max_tokens(mtok)
         or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
         key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-        payload = {"model": first, "temperature": 0.0, "max_tokens": mtok_val,
+        payload = {"model": first, "temperature": temperature, "max_tokens": mtok_val,
                    "messages": or_msgs, "stream": True,
                    "stream_options": {"include_usage": True}}
         if tools:
@@ -630,7 +637,8 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
               f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
               f"tier={'public' if public else 'full'}", flush=True)
 
-    async def _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id):
+    async def _stream_anthropic(q, public, hist, tools, msgs, csys, mtok, req_id,
+                                temperature=0.0):
         """Real SSE streaming for the Anthropic Messages wire shape via httpx."""
         ranked, probs = await asyncio.to_thread(f2.route, q, history=hist)
         first = ranked[0]
@@ -656,7 +664,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         mtok_val = clamp_max_tokens(mtok)
         or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
         key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-        payload = {"model": first, "temperature": 0.0, "max_tokens": mtok_val,
+        payload = {"model": first, "temperature": temperature, "max_tokens": mtok_val,
                    "messages": or_msgs, "stream": True,
                    "stream_options": {"include_usage": True}}
         if tools:

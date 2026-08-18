@@ -31,7 +31,7 @@ Inspect the shipped one:
 ```bash
 python - <<'PY'
 import numpy as np
-z = np.load("data/router_head.npz", allow_pickle=True)
+z = np.load("data/router_head.npz")
 for k in z.files:
     print(f"{k:10} {str(z[k].shape):12} {z[k].dtype}")
 print(float(z["lam"]), [str(m) for m in z["models"]][:3])

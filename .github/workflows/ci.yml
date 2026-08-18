@@ -47,7 +47,7 @@ jobs:
         run: |
           python - <<'PY'
           import json, numpy as np
-          z = np.load("data/router_head.npz", allow_pickle=True)
+          z = np.load("data/router_head.npz", allow_pickle=False)
           models = [str(m) for m in z["models"]]
           n = len(models)
           assert z["W"].shape == (n, 1024), z["W"].shape
@@ -90,7 +90,7 @@ jobs:
       - name: Install (CPU torch)
         run: |
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -q transformers numpy requests huggingface_hub starlette uvicorn httpx
+          pip install -q transformers numpy huggingface_hub starlette uvicorn httpx
 
       - name: Fetch the backbone
         run: python scripts/fetch_backbone.py
@@ -105,7 +105,7 @@ jobs:
           python -m fugal --route "what is 15% of 240?" | tee route.txt
           python - <<'PY'
           import numpy as np
-          models = {str(m) for m in np.load("data/router_head.npz", allow_pickle=True)["models"]}
+          models = {str(m) for m in np.load("data/router_head.npz", allow_pickle=False)["models"]}
           picked = [l.split()[0] for l in open("route.txt") if "<-- WORKER" in l]
           assert len(picked) == 1, f"expected one WORKER line, got {len(picked)}"
           assert picked[0] in models, f"{picked[0]} is not one of the head's models"

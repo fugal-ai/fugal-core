@@ -152,7 +152,7 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
     Returns (message_dict, prompt_tokens, completion_tokens). The message may carry
     `content`, `tool_calls`, or both.
     """
-    import requests
+    import httpx
     key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     payload = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
                "messages": messages}
@@ -163,7 +163,7 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
     last = None
     for attempt in range(retries):
         try:
-            r = requests.post(OR_URL, timeout=timeout,
+            r = httpx.post(OR_URL, timeout=timeout,
                 headers={"Authorization": f"Bearer {key}"}, json=payload)
             if r.status_code in _RETRYABLE:
                 last = RuntimeError(f"http {r.status_code}")
@@ -175,7 +175,7 @@ def or_request(model, messages, max_tokens=4096, temperature=0.0, timeout=180, r
             msg = j["choices"][0]["message"] or {}
             u = j.get("usage", {}) or {}
             return msg, int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0))
-        except (requests.Timeout, requests.ConnectionError) as e:
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
             last = e
         except RuntimeError as e:
             last = e
@@ -218,7 +218,7 @@ class Fugal:
                 f"router head missing: {HEAD}\n"
                 f"  Expected data/router_head.npz, or set FUGAL_HEAD to your own "
                 f"(format: docs/HEAD_FORMAT.md).")
-        z = np.load(HEAD, allow_pickle=True)
+        z = np.load(HEAD)
         all_models = [str(m) for m in z["models"]]
 
         sel = models if models is not None else os.environ.get("FUGAL_MODELS")
@@ -277,7 +277,7 @@ class Fugal:
         return [self.models[i] for i in order], p[order]
 
     def answer_iter(self, query, history=None, tools=None, messages=None, system=None,
-                    max_tokens=None):
+                    max_tokens=None, temperature=0.0):
         """Route once and answer, yielding one event per stage as it happens.
         The last event is {"stage":"final","content":...,"meta":...}. This is the
         single source of truth: answer() and the streaming server both consume it.
@@ -310,7 +310,8 @@ class Fugal:
             # is the single system message rather than one of several the model may ignore.
             msgs = [{"role": "system", "content": sys_prompt}] \
                 + [m for m in base if m.get("role") != "system"]
-            msg, itok, otok = or_request(first, msgs, tools=tools, max_tokens=mtok)
+            msg, itok, otok = or_request(first, msgs, tools=tools, max_tokens=mtok,
+                                       temperature=temperature)
             c = self._price(first, itok, otok); meta["cost"] += c
             meta["input_tokens"] += itok; meta["output_tokens"] += otok
             meta["steps"].append({"role": "worker", "model": first, "cost": c})
@@ -320,7 +321,7 @@ class Fugal:
             return
 
         reply, itok, otok = or_call(first, query, history=history, system=sys_prompt,
-                                    max_tokens=mtok)
+                                    max_tokens=mtok, temperature=temperature)
         c = self._price(first, itok, otok); meta["cost"] += c
         meta["input_tokens"] += itok; meta["output_tokens"] += otok
         meta["steps"].append({"role": "worker", "model": first, "cost": c})
@@ -328,10 +329,11 @@ class Fugal:
         yield {"stage": "final", "content": reply, "meta": meta}
 
     def answer(self, query, verbose=False, history=None, tools=None, messages=None,
-               system=None, max_tokens=None):
+               system=None, max_tokens=None, temperature=0.0):
         reply, meta = None, None
         for ev in self.answer_iter(query, history=history, tools=tools, messages=messages,
-                                   system=system, max_tokens=max_tokens):
+                                   system=system, max_tokens=max_tokens,
+                                   temperature=temperature):
             if verbose and ev["stage"] == "route":
                 alts = ", ".join(ev["alternatives"])
                 print(f"  router: {ev['model']} (p_solve={ev['p_solve']:.2f}; next: {alts})")
