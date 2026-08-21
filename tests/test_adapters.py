@@ -41,6 +41,13 @@ class TestClampMaxTokens(unittest.TestCase):
     def test_upper_bound(self):
         self.assertEqual(clamp_max_tokens(10 ** 9), 32000)
 
+    def test_model_specific_ceiling(self):
+        self.assertEqual(clamp_max_tokens(10 ** 9, model_max=8192), 8192)
+        self.assertEqual(clamp_max_tokens(4000, model_max=8192), 4000)
+
+    def test_model_ceiling_below_default(self):
+        self.assertEqual(clamp_max_tokens(None, model_max=2048), 2048)
+
 
 class TestComposeSystem(unittest.TestCase):
     def test_house_prompt_alone(self):

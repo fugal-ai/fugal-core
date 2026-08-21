@@ -116,7 +116,7 @@ class TestLoadHead(unittest.TestCase):
 
     def test_v1_uses_the_baked_in_mean_cost(self):
         head, prices_path, W, b, mc, models = _make_head(self.tmp)
-        out = load_head(head, load_prices(prices_path))
+        out = load_head(head, load_prices(prices_path)[0])
         self.assertEqual(out[0], models)
         np.testing.assert_array_equal(out[3], mc)
         self.assertEqual(out[4], 2.0)
@@ -126,7 +126,7 @@ class TestLoadHead(unittest.TestCase):
         # THE v2 point: mean_cost = mean_in_tokens*price_in + mean_out_tokens*price_out,
         # evaluated against the sheet AS IT IS NOW, not as it was at fit time.
         head, prices_path, *_ , models = _make_head(self.tmp, v2=True)
-        out = load_head(head, load_prices(prices_path))
+        out = load_head(head, load_prices(prices_path)[0])
         # model i: in=(i+1)*0.5 $/M, out=(i+1)*1.5 $/M; tokens 100i+100 in, 100i+400 out
         expect = [(100 * 0.5 + 400 * 1.5) / 1e6,
                   (200 * 1.0 + 500 * 3.0) / 1e6,
@@ -136,18 +136,18 @@ class TestLoadHead(unittest.TestCase):
     def test_v2_cost_moves_when_prices_move(self):
         head, prices_path, *_ , models = _make_head(self.tmp, v2=True)
         doubled = {m: (2 * pin, 2 * pout)
-                   for m, (pin, pout) in load_prices(prices_path).items()}
+                   for m, (pin, pout) in load_prices(prices_path)[0].items()}
         np.testing.assert_allclose(load_head(head, doubled)[3],
-                                   2 * load_head(head, load_prices(prices_path))[3])
+                                   2 * load_head(head, load_prices(prices_path)[0])[3])
 
     def test_context_flag_is_read(self):
         head, prices_path, *_ = _make_head(self.tmp, context="multiturn")
-        self.assertEqual(load_head(head, load_prices(prices_path))[5], "multiturn")
+        self.assertEqual(load_head(head, load_prices(prices_path)[0])[5], "multiturn")
 
     def test_unpriced_model_is_a_hard_error(self):
         # Inventing a price would silently corrupt cost reports and spend caps.
         head, prices_path, *_ , models = _make_head(self.tmp)
-        prices = load_prices(prices_path)
+        prices = load_prices(prices_path)[0]
         del prices[models[1]]
         with self.assertRaises(SystemExit):
             load_head(head, prices)
@@ -157,7 +157,7 @@ class TestLoadHead(unittest.TestCase):
 
     def test_lambda_resolution_order(self):
         head, prices_path, *_ = _make_head(self.tmp, lam=2.0)
-        prices = load_prices(prices_path)
+        prices = load_prices(prices_path)[0]
         self.assertEqual(load_head(head, prices)[4], 2.0)              # head default
         os.environ["FUGAL_LAMBDA"] = "5.5"
         try:
@@ -170,7 +170,7 @@ class TestLoadHead(unittest.TestCase):
     def test_unknown_subset_model_is_refused(self):
         head, prices_path, *_ = _make_head(self.tmp)
         with self.assertRaises(SystemExit):
-            load_head(head, load_prices(prices_path), models=["not/in-head"])
+            load_head(head, load_prices(prices_path)[0], models=["not/in-head"])
 
 
 class TestLambdaEffect(unittest.TestCase):

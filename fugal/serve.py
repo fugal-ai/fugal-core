@@ -591,7 +591,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                                  "p_solve": float(probs[0])}})
 
             sys_prompt = compose_system(csys)
-            mtok_val = clamp_max_tokens(mtok)
+            mtok_val = clamp_max_tokens(mtok, f2.max_out_tokens.get(first))
             or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
             key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
             payload = {"model": first, "max_tokens": mtok_val,
@@ -734,7 +734,7 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                                               "content_block": {"type": "text", "text": ""}})
 
             sys_prompt = compose_system(csys)
-            mtok_val = clamp_max_tokens(mtok)
+            mtok_val = clamp_max_tokens(mtok, f2.max_out_tokens.get(first))
             or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
             key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
             payload = {"model": first, "max_tokens": mtok_val,

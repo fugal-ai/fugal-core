@@ -88,13 +88,19 @@ DEFAULT_MAX_TOKENS = 4096
 MAX_MAX_TOKENS = 32000
 
 
-def clamp_max_tokens(requested):
-    """Caller's max_tokens -> a sane worker budget. Junk/absent falls back to the default."""
+def clamp_max_tokens(requested, model_max=None):
+    """Caller's max_tokens -> a sane worker budget. Junk/absent falls back to the default.
+
+    When *model_max* is given (from the price sheet's ``max_out``), it replaces
+    the global ``MAX_MAX_TOKENS`` so the ceiling is the backend model's actual
+    limit rather than an arbitrary constant.
+    """
+    ceiling = model_max if model_max is not None else MAX_MAX_TOKENS
     try:
         n = int(requested)
     except (TypeError, ValueError):
-        return DEFAULT_MAX_TOKENS
-    return max(1, min(n, MAX_MAX_TOKENS)) if n > 0 else DEFAULT_MAX_TOKENS
+        return min(DEFAULT_MAX_TOKENS, ceiling)
+    return max(1, min(n, ceiling)) if n > 0 else min(DEFAULT_MAX_TOKENS, ceiling)
 
 
 def compose_system(client_system):
@@ -214,9 +220,17 @@ def or_call(model, prompt, max_tokens=4096, temperature=None, timeout=180, retri
 
 # ---- loading the trained artifact ---------------------------------------------
 def load_prices(path):
-    """data/models_*.json -> {model_id: (usd_per_input_token, usd_per_output_token)}."""
+    """data/models_*.json -> {model_id: (usd_per_input_token, usd_per_output_token)}.
+
+    Also returns a second dict {model_id: max_output_tokens} when the sheet
+    carries ``max_out`` (added by refresh_prices.py from OpenRouter metadata).
+    Callers that need only prices can ignore the second return value.
+    """
     with open(path) as f:
-        return {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in json.load(f)}
+        rows = json.load(f)
+    prices = {m["id"]: (m["in"] / 1e6, m["out"] / 1e6) for m in rows}
+    max_out = {m["id"]: int(m["max_out"]) for m in rows if "max_out" in m}
+    return prices, max_out
 
 
 def load_head(head_path, prices, models=None, router_lambda=None):
@@ -305,7 +319,7 @@ class Fugal:
     """
 
     def __init__(self, models=None, router_lambda=None):
-        self.prices = load_prices(PRICES)
+        self.prices, self.max_out_tokens = load_prices(PRICES)
         (self.models, self.W, self.b, self.mean_cost,
          self.lam, self.head_context) = load_head(HEAD, self.prices, models=models,
                                                   router_lambda=router_lambda)
@@ -357,12 +371,12 @@ class Fugal:
         # in/out token totals are accumulated alongside cost so the Anthropic-shaped
         # endpoint can report a real usage block instead of an estimate.
         sys_prompt = compose_system(system)
-        mtok = clamp_max_tokens(max_tokens)
         meta = {"cost": 0.0, "steps": [], "input_tokens": 0, "output_tokens": 0}
         ranked, probs = self.route(
             route_on or query,
             history=history if self.head_context == "multiturn" else None)
         first = ranked[0]
+        mtok = clamp_max_tokens(max_tokens, self.max_out_tokens.get(first))
         meta["p_solve"] = float(probs[0])          # router confidence in the chosen worker
         meta["ranked"] = list(ranked[:3])
         meta["final_model"] = first

@@ -44,7 +44,7 @@ OR_MODELS = "https://openrouter.ai/api/v1/models"       # public, needs no key
 
 
 def fetch_live():
-    """OpenRouter's public catalogue -> {id: (usd_per_1M_in, usd_per_1M_out)}."""
+    """OpenRouter's public catalogue -> {id: (usd_per_1M_in, usd_per_1M_out, max_out)}."""
     req = urllib.request.Request(OR_MODELS, headers={"User-Agent": "fugal-refresh-prices"})
     with urllib.request.urlopen(req, timeout=60) as r:
         data = json.loads(r.read().decode("utf-8"))["data"]
@@ -53,7 +53,10 @@ def fetch_live():
         p = m.get("pricing") or {}
         try:
             # OpenRouter quotes USD per token; the sheet is USD per million.
-            out[m["id"]] = (float(p["prompt"]) * 1e6, float(p["completion"]) * 1e6)
+            tp = m.get("top_provider") or {}
+            max_out = tp.get("max_completion_tokens") or m.get("max_completion_tokens")
+            out[m["id"]] = (float(p["prompt"]) * 1e6, float(p["completion"]) * 1e6,
+                            int(max_out) if max_out else None)
         except (KeyError, TypeError, ValueError):
             continue                                    # unpriced/variant entries
     return out
@@ -61,7 +64,8 @@ def fetch_live():
 
 def load_sheet():
     with io.open(PRICES, encoding="utf-8") as f:
-        return {m["id"]: (float(m["in"]), float(m["out"])) for m in json.load(f)}
+        return {m["id"]: (float(m["in"]), float(m["out"]), m.get("max_out"))
+                for m in json.load(f)}
 
 
 def head_models():
@@ -90,11 +94,17 @@ def write_sheet(models, prices):
     """
     w = max(len(json.dumps(m)) for m in models)
     iw = max(len(money(p[0])) for p in prices.values())
+    ow = max(len(money(p[1])) for p in prices.values())
     rows = []
     for m in models:
-        pin, pout = prices[m]
-        rows.append(f'  {{"id": {json.dumps(m) + ",":<{w + 1}} '
-                    f'"in": {money(pin) + ",":<{iw + 1}} "out": {money(pout)}}}')
+        pin, pout, max_out = prices[m]
+        base = (f'  {{"id": {json.dumps(m) + ",":<{w + 1}} '
+                f'"in": {money(pin) + ",":<{iw + 1}} "out": {money(pout) + ",":<{ow + 1}}')
+        if max_out is not None:
+            base += f' "max_out": {max_out}}}'
+        else:
+            base = base.rstrip().rstrip(",") + "}"
+        rows.append(base)
     text = "[\n" + ",\n".join(rows) + "\n]\n"
     json.loads(text)                                    # never write a file we cannot read
     with io.open(PRICES, "w", encoding="utf-8", newline="\n") as f:
@@ -121,26 +131,29 @@ def main():
         sys.exit(f"price sheet is missing head models: {', '.join(missing)}")
 
     gone, drifted, new_prices = [], [], {}
-    print(f"  {'model':34}{'in $/M':>10}{'out $/M':>10}{'drift':>10}")
+    print(f"  {'model':34}{'in $/M':>10}{'out $/M':>10}{'max_out':>10}{'drift':>10}")
     for m in models:
         old = sheet[m]
         if m not in live:
             gone.append(m)
             new_prices[m] = old
-            print(f"  {m:34}{old[0]:10.3f}{old[1]:10.3f}{'GONE':>10}")
+            print(f"  {m:34}{old[0]:10.3f}{old[1]:10.3f}"
+                  f"{(str(old[2]) if old[2] else ''):>10}{'GONE':>10}")
             continue
         new = live[m]
-        new_prices[m] = new
+        max_out = new[2] if new[2] is not None else old[2]
+        new_prices[m] = (new[0], new[1], max_out)
         # Blended midpoint is only for deciding whether to SAY something; both numbers are
         # always written. It keeps a 0.001 rounding change from reading like news.
         o, n = (old[0] + old[1]) / 2, (new[0] + new[1]) / 2
         pct = ((n / o) - 1) * 100 if o else 0.0
+        mo_str = str(max_out) if max_out else ""
         if abs(pct) >= args.tolerance:
             drifted.append((m, pct))
-            print(f"  {m:34}{new[0]:10.3f}{new[1]:10.3f}{pct:9.0f}%"
+            print(f"  {m:34}{new[0]:10.3f}{new[1]:10.3f}{mo_str:>10}{pct:9.0f}%"
                   f"   was {old[0]:g}/{old[1]:g}")
         else:
-            print(f"  {m:34}{new[0]:10.3f}{new[1]:10.3f}{'':>10}")
+            print(f"  {m:34}{new[0]:10.3f}{new[1]:10.3f}{mo_str:>10}{'':>10}")
 
     print()
     if gone:
