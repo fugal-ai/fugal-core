@@ -31,7 +31,7 @@ version here. Head changes are called out explicitly under their release.
 - `.github/workflows/prices.yml` — weekly scheduled check of the price sheet against
   OpenRouter; opens a PR with the refreshed sheet when drift exceeds tolerance.
 - `pyproject.toml`: `pip install -e .` and a `fugal` console script.
-- `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue and PR templates, Dependabot for Actions.
+- `SECURITY.md`, issue and PR templates, Dependabot for Actions.
 
 ### Changed
 
