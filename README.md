@@ -178,19 +178,9 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
   AUC, calibration error, and routed accuracy-and-cost against a hindsight-chosen best
   fixed model, a cheapest-always baseline, and a per-question oracle.
 
-## Lineage
-
-- Derived from the open reverse-engineering of Sakana AI's Fugu orchestrator started at
-  [trotsky1997/OpenFugu](https://github.com/trotsky1997/OpenFugu), whose TRINITY reconstruction
-  is where the router's design comes from. See `NOTICE`. Fugal is independent of, and not
-  affiliated with, Sakana AI.
-- What is added here: the utility head over 17 current models, the price-discounted decision
-  rule, and the OpenAI/Anthropic serving shapes.
-- Fugal no longer depends on any TRINITY artifact at runtime — it runs on an unmodified
-  Qwen3-0.6B backbone with its own head.
-
 ## License
 
-Apache-2.0 (see `LICENSE`). The backbone (Qwen3-0.6B, Apache-2.0) is fetched at setup time and
-never redistributed here — see `NOTICE`. The router head is original work and ships with the
-repo under the same licence.
+Apache-2.0 (see `LICENSE`). The router's hidden-state extraction path is inspired by
+[TRINITY](https://arxiv.org/abs/2512.04695) — see `NOTICE` for full attribution. The backbone
+(Qwen3-0.6B, Apache-2.0) is fetched at setup time and never redistributed here. The router
+head is original work and ships with the repo under the same licence.

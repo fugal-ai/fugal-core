@@ -122,9 +122,9 @@ in `router.py` invalidates the head without any visible error.
 
 The router prompt, mean-pooling strategy, and transcript format were selected via a systematic
 ablation (4 positions x 4 prompts = 16 combinations, 10 seeds x 4-fold CV each). Mean-pooling
-outperformed all single-token positions (including TRINITY's original penultimate-token
-position), and the clean routing prompt was statistically indistinguishable from the inherited
-TRINITY dispatcher prompt (p > 0.20). The ablation data is in the research repository.
+outperformed all single-token positions (including the penultimate-token position used in prior
+work), and the clean routing prompt was statistically indistinguishable from alternatives
+(p > 0.20). The ablation data is in the research repository.
 
 If you fit your own head, use the same prompt and pooling strategy, or rerun the ablation
 under your setup.

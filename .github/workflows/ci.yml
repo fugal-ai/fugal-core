@@ -69,7 +69,7 @@ jobs:
       # a push, so it fails the build rather than waiting for review to catch it.
       - name: No billing, auth, or cascade strings
         run: |
-          if git grep -nEi 'supabase|sk-fugal|sk-fugu|credit_micro|bill_margin|ledger|oauth|cascade|escalat|verifier|model_iter_60|openfugu-(web|core)' \
+          if git grep -nEi 'supabase|sk-fugal|sk-fugu|credit_micro|bill_margin|ledger|oauth|cascade|escalat|verifier|model_iter_60|fugal-(web|billing)' \
                -- . ':(exclude).github/workflows/ci.yml'; then
             echo "::error::forbidden string found (see matches above)"
             exit 1

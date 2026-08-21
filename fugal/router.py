@@ -27,17 +27,10 @@ reads those declarations; upgrading routing behaviour means shipping a new head.
 Serving (OpenAI + Anthropic wire shapes), the CLI, and the spend controls live in
 serve.py. This file is the model.
 
-PROVENANCE (Apache-2.0 s4(b) — this file contains modified third-party material).
-The hidden-state extraction path below — ROUTER_SYSTEM_PROMPT,
-FugalRouter.format_transcript and FugalRouter.hidden — is DERIVED FROM
-`openfugu/mini.py` in github.com/trotsky1997/OpenFugu, Copyright 2026 The OpenFugu
-Contributors, Apache-2.0. Fugal's changes to it: the SVF backbone adaptation was
-removed (this runs an unmodified Qwen3-0.6B, no TRINITY checkpoint), the bias-free
-(10, 1024) agent/role logit head was replaced by the (17, 1024) per-model logistic
-head with bias and the price-discounted decision rule, the hidden state is now
-L2-normalised and mean-pooled across all input tokens, the TRINITY dispatcher system
-prompt was replaced by a clean routing prompt, and the multi-turn Coordinator loop
-was not carried over. See NOTICE.
+PROVENANCE (Apache-2.0 §4(b)). The hidden-state extraction path (ROUTER_SYSTEM_PROMPT,
+FugalRouter.format_transcript, FugalRouter.hidden) is derived from `openfugu/mini.py`,
+Copyright 2026 The OpenFugu Contributors, Apache-2.0. The derived material has been
+substantially modified. See NOTICE.
 """
 from __future__ import annotations
 import json, os, random, threading, time

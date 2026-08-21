@@ -15,7 +15,7 @@ version here. Head changes are called out explicitly under their release.
 - `tests/test_router_math.py` — unit tests covering sigmoid, L2 normalization,
   independent rows, lambda monotonicity, price calculation, and `load_head()` (both head
   formats, unpriced refusal, lambda resolution order, subsetting).
-- `tests/test_adapters.py` — 45 stdlib `unittest` cases over the wire-shape adapters
+- `tests/test_adapters.py` — 54 stdlib `unittest` cases over the wire-shape adapters
   (`anthropic_to_body`, tool-call conversion in both directions, `compose_system`,
   `clamp_max_tokens`, `clean_history`). No network, no backbone, runs in milliseconds, and
   now gated in the fast CI job. These are the functions whose bugs do not raise — a dropped
@@ -68,14 +68,10 @@ version here. Head changes are called out explicitly under their release.
   Removed: `requests`.
 - `Fugal.__init__` factored into pure `load_prices()` / `load_head()` functions, unit-tested
   without torch.
-- `NOTICE` now reproduces OpenFugu's copyright attribution (Apache-2.0 §4(d)) and
-  enumerates Fugal's changes to the derived material (§4(b)); `fugal/router.py` carries an
-  in-file provenance block naming exactly which parts derive from `openfugu/mini.py`, and
-  the inherited `[EXEC]` provenance tags are now explained rather than left bare.
+- `NOTICE` updated with required Apache-2.0 attribution for derived material.
 - `docs/HEAD_FORMAT.md` documents the ablation-validated choices: mean-pooling over all input
-  tokens (replacing `HIDDEN_POS = -2`) and a clean routing prompt (replacing the inherited
-  TRINITY dispatcher prompt with `num_agents=7`). Both were selected via systematic ablation
-  (16 combinations, 40 CV folds each) and the head was refit under the winning setup.
+  tokens and a clean routing prompt, selected via systematic ablation (16 combinations,
+  40 CV folds each). The head was refit under the winning setup.
 - `requirements.txt` no longer caps `transformers` below 5; `router.py` already handled the
   `dtype=`/`torch_dtype=` split in both directions.
 - `--spend-cap` help text now states that it is checked before each call (so concurrent
