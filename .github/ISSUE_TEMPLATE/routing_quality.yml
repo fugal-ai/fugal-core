@@ -9,7 +9,7 @@ body:
 
         - **The head reads the latest message only**, and was fit on standalone questions.
           On a follow-up turn ("now in Rust") the signal is genuinely weaker.
-        - **Cost is a tiebreaker, not a driver.** At the shipped `λ=2.0` the accuracy spread
+        - **Cost is a tiebreaker, not a driver.** At the shipped `λ=1.0` the accuracy spread
           across the 17 models usually dominates price. `--router-lambda 10` will show you
           how much of the decision the cost term is actually making.
 

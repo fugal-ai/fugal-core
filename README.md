@@ -36,14 +36,14 @@ https://download.pytorch.org/whl/cpu` *before* `pip install -e .` keeps you on t
 
 ```
   model                             p_solve   $/query  utility
-  deepseek/deepseek-v4-flash          0.985   0.00026    0.984  ################### <-- WORKER
+  deepseek/deepseek-v4-flash          0.985   0.00026    0.985  ################### <-- WORKER
+  deepseek/deepseek-v4-pro            0.985   0.00154    0.983  ###################
   meta-llama/llama-4-maverick         0.983   0.00030    0.983  ###################
-  deepseek/deepseek-v4-pro            0.985   0.00154    0.981  ###################
-  openai/gpt-5.4-nano                 0.981   0.00055    0.980  ###################
-  mistralai/mistral-large-2512        0.980   0.00140    0.978  ###################
+  moonshotai/kimi-k2.6                0.991   0.00956    0.981  ###################
+  openai/gpt-5.4-nano                 0.981   0.00055    0.981  ###################
   ...
-  openai/gpt-5.5                      0.990   0.01965    0.950  ###################
-  google/gemini-3.1-pro-preview       0.994   0.02537    0.943  ###################
+  google/gemini-3.5-flash             0.981   0.01215    0.969  ###################
+  google/gemini-3.1-pro-preview       0.994   0.02537    0.968  ###################
 ```
 
 Read the first and last rows: Gemini Pro is likelier to be right (0.994 vs 0.985) and costs
@@ -53,9 +53,9 @@ product. A harder question lowers every model's odds and widens the gaps between
 ```bash
 $ python -m fugal --route "prove that the halting problem is undecidable"
   model                             p_solve   $/query  utility
-  deepseek/deepseek-v4-flash          0.979   0.00026    0.978  ################### <-- WORKER
-  openai/gpt-5.4-nano                 0.976   0.00055    0.975  ###################
-  deepseek/deepseek-v4-pro            0.978   0.00154    0.975  ###################
+  deepseek/deepseek-v4-flash          0.979   0.00026    0.979  ################### <-- WORKER
+  deepseek/deepseek-v4-pro            0.978   0.00154    0.976  ###################
+  moonshotai/kimi-k2.6                0.986   0.00956    0.976  ###################
 ```
 
 With the shipped head that move is small — see "What this does not claim" below.
@@ -71,9 +71,9 @@ Most people hold keys for three or four providers, not seventeen. Restrict the p
 $ python -m fugal --models "openai/gpt-5.4-nano,deepseek/deepseek-v4-flash,meta-llama/llama-4-maverick" \
     --route "what is 15% of 240?"
   model                             p_solve   $/query  utility
-  deepseek/deepseek-v4-flash          0.985   0.00026    0.984  ################### <-- WORKER
+  deepseek/deepseek-v4-flash          0.985   0.00026    0.985  ################### <-- WORKER
   meta-llama/llama-4-maverick         0.983   0.00030    0.983  ###################
-  openai/gpt-5.4-nano                 0.981   0.00055    0.980  ###################
+  openai/gpt-5.4-nano                 0.981   0.00055    0.981  ###################
 ```
 
 `FUGAL_MODELS="a,b,c"` does the same thing as an environment variable, including for the
@@ -151,7 +151,7 @@ python verify/verify_routing.py         # needs the backbone; mocked worker, $0
 
 Three things ever need updating, and everything else is code: the **head** (retrain as the
 model landscape changes; forks drop in their own via `data/router_head.npz` or `FUGAL_HEAD`),
-**λ** (`--router-lambda` / `FUGAL_LAMBDA` overrides the head's trained default of 2.0; higher
+**λ** (`--router-lambda` / `FUGAL_LAMBDA` overrides the head's default of 1.0; higher
 trades down to cheaper models on easy questions), and the **price sheet**
 (`scripts/refresh_prices.py` re-syncs it from OpenRouter). `FUGAL_MODEL` points at any
 Qwen3-0.6B checkout if you already have one and want to skip the download.
@@ -175,7 +175,7 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
 - **On the shipped head, `p_solve` is high and nearly flat.** Across twelve deliberately
   varied test questions (a greeting, arithmetic, a translation, a Byzantine-consensus
   design, nonsense) every model scored between 0.91 and 0.997, and each model's score moved
-  by about 0.01 from question to question. At `λ=2.0` the price term is usually larger than
+  by about 0.01 from question to question. At `λ=1.0` the price term is usually larger than
   those gaps, so the cheapest capable models win most queries and the pricier ones win only
   when the head sees a real difference. Whether that reflects the models or a weak head is
   exactly what `verify/verify_calibration.py` measures — and it needs the graded fixture

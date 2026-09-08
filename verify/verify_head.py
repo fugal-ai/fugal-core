@@ -165,7 +165,7 @@ check("subsetting never reorders the surviving models", not rank_breaks,
       f"{rank_breaks[:2]}")
 
 # --- 6. lambda means what HEAD_FORMAT.md says ------------------------------------
-# "at lam=2.0, a model must be 2 percentage points likelier to be right to justify one
+# "at lam=1.0, a model must be 1 percentage point likelier to be right to justify one
 # extra cent per query". Assert the DECISION, not the arithmetic: two models one cent
 # apart in cost, with a p gap just below and just above lam*0.01 — the winner must
 # flip exactly at that boundary.

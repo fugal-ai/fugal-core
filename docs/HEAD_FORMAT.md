@@ -9,7 +9,7 @@ means shipping a new head, never editing code.
 W                (17, 1024)  float32   one independent logistic row per model
 b                (17,)       float32   per-model bias
 models           (17,)       <U29      OpenRouter model ids, index-aligned to every array
-lam              scalar      float64   cost sensitivity; the shipped head is 2.0
+lam              scalar      float64   cost sensitivity; the shipped head is 1.0
 
 # v2 heads (current format)
 mean_in_tokens   (17,)       float64   mean input tokens per query, measured at fit time
@@ -44,8 +44,8 @@ conversation history into the forward pass **only** for a `"multiturn"` head; a
 `"standalone"` head (the shipped one) routes on the latest user turn alone, because hidden
 states from a distribution the head never saw make it route worse, silently.
 
-`lam` converts dollars into probability points: at `lam=2.0`, a model must be 2 percentage
-points likelier to be right to justify one extra cent per query. Override it at runtime with
+`lam` converts dollars into probability points: at `lam=1.0`, a model must be 1 percentage
+point likelier to be right to justify one extra cent per query. Override it at runtime with
 `--router-lambda`, `FUGAL_LAMBDA`, or `Fugal(router_lambda=...)` — that changes the decision
 rule, never the stored head.
 

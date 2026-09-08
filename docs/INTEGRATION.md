@@ -231,7 +231,7 @@ remember that the outermost spend brake is the hard limit on the OpenRouter key 
   is not touched.
 - **Cost decides most routes.** With the shipped head, `p_solve` is high and nearly flat
   across the 17 models (the README's "What this does not claim" has the numbers), so at
-  **λ=2.0** the cheapest capable models win most queries: `"hi"`, `"what is 15% of 240?"`
+  **λ=1.0** the cheapest capable models win most queries: `"hi"`, `"what is 15% of 240?"`
   and `"reverse a linked list in python"` all route to `deepseek/deepseek-v4-flash`, and
   still do at `--router-lambda 10`. A pricier model wins only where the head sees a real
   gap. Use `--models` to bound the pool if you want a floor on capability rather than a

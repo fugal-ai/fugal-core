@@ -14,7 +14,7 @@ Initial public release.
 
 - **The router.** A 17-model logistic head over a mean-pooled, L2-normalised Qwen3-0.6B
   hidden state, and the price-discounted decision rule `utility = p - λ·mean_cost`
-  (`docs/HEAD_FORMAT.md`). The shipped head is v1 (`mean_cost` baked in at fit time); the
+  (`docs/HEAD_FORMAT.md`). The shipped head is v1 (`mean_cost` baked in at fit time, λ=1.0); the
   v2 format (per-model token statistics, routing cost computed from the current price sheet
   at load) and a `context` declaration (`standalone` / `multiturn`) are supported. Subsetting
   with `--models` / `FUGAL_MODELS` is exact. The router reads the latest *user* turn — never
