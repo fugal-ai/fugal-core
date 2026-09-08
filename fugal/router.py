@@ -299,6 +299,8 @@ def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
     with open(head_path, "rb") as head_file:
         z = success.read_archive(head_file.read(success.MAX_BYTES + 1))
     is_success = "contract" in z
+    if not is_success and ({"profile_id", "cost_profile_id"} & set(z)):
+        raise ValueError("success metadata requires an explicit contract version")
     if is_success:
         success.validate_head(z)
     all_models = [str(m) for m in z["models"]]

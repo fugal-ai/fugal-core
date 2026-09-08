@@ -84,6 +84,15 @@ class SuccessContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.read_archive(b"x" * (c.MAX_BYTES + 1))
 
+    def test_missing_version_cannot_downgrade_to_legacy(self):
+        z, _ = fixture()
+        z.pop("contract")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "head.npz"
+            path.write_bytes(serialized(z))
+            with self.assertRaises(ValueError, msg="missing explicit contract"):
+                router.load_head(path, {m: (0., 0.) for m in z["models"]})
+
     def test_cache_rejects_other_profile_or_questions(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cache.npz"
