@@ -36,6 +36,8 @@ Initial public release.
   per turn against the real backbone, mocked worker); `verify/verify_calibration.py` (AUC,
   Brier, ECE and routed accuracy-vs-cost against baselines — needs a graded fixture,
   `docs/EVALUATION.md`).
-- **The price sheet.** `data/models_2026-06.json` is billing input (and routing input for a
-  v2 head). `scripts/refresh_prices.py` re-syncs it with OpenRouter, `--check` reports drift
-  without writing, and a weekly workflow opens a PR when prices move.
+- **Cost accounting.** Every cost figure and both spend caps count what OpenRouter reports
+  it charged for the call (`usage.cost`); `data/models_2026-06.json` is the fallback and
+  the source of the free routing-cost estimates (and routing input for a v2 head).
+  `scripts/refresh_prices.py` re-syncs it with OpenRouter, `--check` reports drift without
+  writing, and a weekly workflow fails loudly when prices move.

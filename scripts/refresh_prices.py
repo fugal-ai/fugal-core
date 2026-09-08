@@ -7,11 +7,10 @@ refresh_prices.py — bring data/models_2026-06.json back in line with OpenRoute
     python scripts/refresh_prices.py --check    # show the drift, change nothing, exit 1 if any
     python scripts/refresh_prices.py --tolerance 10   # --check only cares about >10% moves
 
-WHY THIS MATTERS MORE THAN IT LOOKS. This sheet is BILLING input everywhere: Fugal._price()
-multiplies these numbers by real token counts to produce meta["cost"], the X-Fugal-Cost-USD
-header, and the running total that --spend-cap and --daily-cap compare against. When a
-provider moves its price and this file does not, every one of those is quietly wrong, and a
-"cap" that miscounts is worse than no cap.
+What this sheet is for. Billing counts what OpenRouter reports it charged per call
+(usage.cost) and only falls back to this sheet when a response carries no charge. The sheet
+is what the free --route / /v1/route cost estimates are computed from, and the max_out
+column is each model's real output-token ceiling.
 
 Whether it is ALSO routing input depends on the head format (docs/HEAD_FORMAT.md):
 

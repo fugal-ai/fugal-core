@@ -47,8 +47,9 @@ with no token and a live OpenRouter key, which makes a reflected `Origin` a way 
 you visit to spend your money. CI asserts both; `SECURITY.md` explains the threat model.
 
 **`mean_cost` in the head and `data/models_2026-06.json` are not the same number and must not
-be synced.** The first is routing input and is frozen with the head; the second is billing
-input and should track reality. `scripts/refresh_prices.py` only ever touches the second.
+be synced.** The first is routing input and is frozen with the head; the second is the
+routing-cost estimate shown by `--route` and the billing fallback, and should track reality.
+`scripts/refresh_prices.py` only ever touches the second.
 
 ## Scope
 

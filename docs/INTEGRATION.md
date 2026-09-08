@@ -173,8 +173,9 @@ r = client.chat.completions.create(model="fugal/auto",
 print(r.model)                    # fugal/<the model that actually answered>
 ```
 
-The response carries a `fugal` block with `final_model`, `cost`, `p_solve`, and `steps`, plus
-an `X-Fugal-Cost-USD` header — so you can always see who answered and what it cost.
+The response carries a `fugal` block with `final_model`, `cost`, `cost_source`, `p_solve`,
+and `steps`, plus an `X-Fugal-Cost-USD` header — so you can always see who answered and
+what it cost.
 
 ---
 
@@ -224,11 +225,11 @@ remember that the outermost spend brake is the hard limit on the OpenRouter key 
 - **Streamed spend is settled even if the client disconnects mid-stream**, but the token
   usage arrives in the upstream's final chunk, so a very early disconnect can under-count.
   The hard limit on the OpenRouter key itself is the outermost brake.
-- **Reported cost is only as good as the price sheet.** `X-Fugal-Cost-USD`, the `fugal.cost`
-  field and the spend caps are all computed from `data/models_2026-06.json`. Providers move
-  their prices; `python scripts/refresh_prices.py` re-syncs it, and `--check` reports drift
-  without writing. The `mean_cost` used for *routing* is frozen with the head on purpose and
-  is not touched.
+- **Reported cost is what OpenRouter charged.** `X-Fugal-Cost-USD`, the `fugal.cost` field
+  and the spend caps count the `usage.cost` OpenRouter returns for each call; the price
+  sheet is the fallback when a response carries none, and `fugal.cost_source` says which
+  was used. The sheet still drives the free `/v1/route` estimates; `python
+  scripts/refresh_prices.py` re-syncs it and `--check` reports drift without writing.
 - **Cost decides most routes.** With the shipped head, `p_solve` is high and nearly flat
   across the 17 models (the README's "What this does not claim" has the numbers), so at
   **λ=1.0** the cheapest capable models win most queries: `"hi"`, `"what is 15% of 240?"`

@@ -169,10 +169,11 @@ revision the head declares (`docs/HEAD_FORMAT.md`), since the head was fit on th
   `mean_cost` bakes in fit-time prices, so routing trades against those until the head is
   regenerated. The v2 format fixes this by storing measured token counts instead and
   computing routing cost from the current sheet at load (`docs/HEAD_FORMAT.md`).
-  `data/models_2026-06.json` is *billing* input either way: it is what `meta.cost`,
-  `X-Fugal-Cost-USD` and the spend caps are computed from, so it should be current. Run
-  `python scripts/refresh_prices.py` (or `--check`) to keep it that way; a stale sheet means
-  your cap is counting the wrong dollars.
+  Billing does not depend on the sheet: `meta.cost`, `X-Fugal-Cost-USD` and the spend caps
+  count what OpenRouter reports it charged for each call, and fall back to the sheet only
+  when a response carries no charge (`cost_source` says which). The sheet is what the free
+  `--route` / `/v1/route` cost estimates use, so `python scripts/refresh_prices.py` (or
+  `--check`, which CI runs weekly) keeps those honest.
 - **On the shipped head, `p_solve` is high and nearly flat.** Across twelve deliberately
   varied test questions (a greeting, arithmetic, a translation, a Byzantine-consensus
   design, nonsense) every model scored between 0.91 and 0.997, and each model's score moved

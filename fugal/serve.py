@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import use_utf8
-from .router import Fugal, clamp_max_tokens, compose_system, OR_URL
+from .router import Fugal, call_cost, clamp_max_tokens, compose_system, OR_URL
 
 MAX_BODY = 256 * 1024
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -601,12 +601,13 @@ def build_app(f2, *, host="127.0.0.1", token=None, spend_cap=None, daily_cap=Non
             f2.route, rq, history=hist if f2.head_context == "multiturn" else None)
         first = ranked[0]
         meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
-                "final_model": first, "cost": 0.0, "steps": [],
+                "final_model": first, "cost": 0.0, "cost_source": None, "steps": [],
                 "input_tokens": 0, "output_tokens": 0}
         payload = {"model": first,
                    "max_tokens": clamp_max_tokens(mtok, f2.max_out_tokens.get(first)),
                    "messages": worker_messages(q, hist, tools, msgs, compose_system(csys)),
-                   "stream": True, "stream_options": {"include_usage": True}}
+                   "stream": True, "stream_options": {"include_usage": True},
+                   "usage": {"include": True}}
         if temperature is not None:
             payload["temperature"] = temperature
         if tools:
@@ -616,16 +617,17 @@ def build_app(f2, *, host="127.0.0.1", token=None, spend_cap=None, daily_cap=Non
     def settle(acct, meta, public, hist, kind):
         """Charge the meter for a stream, exactly once: on the normal path, AND from
         `finally` when the client disconnects mid-stream (Starlette closes the generator),
-        so streamed spend still counts against the caps. usage is OpenRouter's LAST chunk,
-        so a very early disconnect can still under-count — the hard limit on the OpenRouter
-        key itself remains the outermost brake (SECURITY.md)."""
+        so streamed spend still counts against the caps. usage (with OpenRouter's own
+        charge in `cost`) is the upstream's LAST chunk, so a very early disconnect can
+        still under-count — the hard limit on the OpenRouter key itself remains the
+        outermost brake (SECURITY.md)."""
         if acct.settled:
             return
         acct.settled = True
-        itok = int(acct.usage.get("prompt_tokens", 0))
-        otok = int(acct.usage.get("completion_tokens", 0))
-        cost = f2._price(meta["final_model"], itok, otok)
-        meta.update(cost=cost, input_tokens=itok, output_tokens=otok)
+        cost, src = call_cost(f2.prices, meta["final_model"], acct.usage)
+        meta.update(cost=cost, cost_source=src,
+                    input_tokens=int(acct.usage.get("prompt_tokens") or 0),
+                    output_tokens=int(acct.usage.get("completion_tokens") or 0))
         meta["steps"].append({"role": "worker", "model": meta["final_model"], "cost": cost})
         tcalls = acct.tool_calls()
         if tcalls:
@@ -819,9 +821,9 @@ def main():
                     help="serve only: cumulative USD ceiling; past it the server returns 402. "
                          "A brake, not an accounting record: it is checked before each call, "
                          "so concurrent requests can overshoot it slightly, it resets on "
-                         "restart, and it counts the price sheet's numbers — run "
-                         "scripts/refresh_prices.py to keep those true. Set a hard limit on "
-                         "the OpenRouter key as well.")
+                         "restart, and it counts what OpenRouter reports it charged for "
+                         "each call (the price sheet only when that is missing). Set a hard "
+                         "limit on the OpenRouter key as well.")
     ap.add_argument("--cors-origin", action="append", default=None, metavar="ORIGIN",
                     help="serve only: allow browser requests from this origin (repeatable; "
                          "also FUGAL_CORS_ORIGINS, comma-separated). Default is NO CORS at "

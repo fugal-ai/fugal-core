@@ -23,8 +23,9 @@ Two things bound the damage, and both are the operator's job to set:
 - **A hard spend limit on the OpenRouter key itself**, set in OpenRouter's dashboard. This
   is the only limit that survives a bug in this code, and it is the one that matters.
 
-Set both. `--spend-cap` counts using `data/models_2026-06.json`; run
-`scripts/refresh_prices.py` so those numbers are true, or the cap counts the wrong dollars.
+Set both. `--spend-cap` counts what OpenRouter reports it charged for each call
+(`usage.cost`), falling back to `data/models_2026-06.json` only when a response carries no
+charge; every cost figure says which it used (`cost_source`).
 
 ## Defaults you should know about
 

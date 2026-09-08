@@ -160,12 +160,14 @@ def or_request(model, messages, max_tokens=4096, temperature=None, timeout=180, 
     routing to a different model per message is no reason to override every model's
     sampling defaults with an opinion of ours.
 
-    Returns (message_dict, prompt_tokens, completion_tokens). The message may carry
-    `content`, `tool_calls`, or both.
+    Returns (message_dict, usage_dict). The message may carry `content`, `tool_calls`,
+    or both. usage is OpenRouter's block verbatim — prompt_tokens, completion_tokens and,
+    with usage accounting requested, `cost`: what this call was actually charged.
     """
     import httpx
     key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-    payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    payload = {"model": model, "max_tokens": max_tokens, "messages": messages,
+               "usage": {"include": True}}
     if temperature is not None:
         payload["temperature"] = temperature
     if tools:
@@ -184,9 +186,7 @@ def or_request(model, messages, max_tokens=4096, temperature=None, timeout=180, 
             j = r.json()
             if "choices" not in j:
                 raise ValueError(str(j.get("error", j))[:200])
-            msg = j["choices"][0]["message"] or {}
-            u = j.get("usage", {}) or {}
-            return msg, int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0))
+            return j["choices"][0]["message"] or {}, j.get("usage") or {}
         except (httpx.TimeoutException, httpx.NetworkError) as e:
             last = e
         except RuntimeError as e:
@@ -200,16 +200,30 @@ def or_request(model, messages, max_tokens=4096, temperature=None, timeout=180, 
 
 def or_call(model, prompt, max_tokens=4096, temperature=None, timeout=180, retries=3,
             history=None, system=None):
-    """Text-only wrapper over or_request. Kept at its original 3-tuple RETURN contract
-    because several call sites and the mock in verify/ depend on that shape - the tool path
-    uses or_request directly rather than widening this. `system`, when given, is prepended as
-    a system message (the house identity/format prompt for worker calls)."""
+    """Text-only wrapper over or_request -> (text, usage). The tool path uses or_request
+    directly. `system`, when given, is prepended as a system message (the house
+    identity/format prompt for worker calls)."""
     msgs = ([{"role": "system", "content": system}] if system else []) \
         + list(history or []) + [{"role": "user", "content": prompt}]
-    msg, itok, otok = or_request(model, msgs, max_tokens=max_tokens, temperature=temperature,
-                                 timeout=timeout, retries=retries)
-    text = (msg.get("content") or "").strip() or (msg.get("reasoning") or "")
-    return text, itok, otok
+    msg, usage = or_request(model, msgs, max_tokens=max_tokens, temperature=temperature,
+                            timeout=timeout, retries=retries)
+    return (msg.get("content") or "").strip() or (msg.get("reasoning") or ""), usage
+
+
+def call_cost(prices, model, usage):
+    """USD for one worker call -> (cost, source).
+
+    OpenRouter reports what it actually charged in `usage.cost` (credits, priced one to
+    one in USD); that is the number the spend caps should count, so it wins whenever it is
+    present. The price sheet is the fallback — an estimate from token counts — and the
+    source is reported so a cost figure always says which it was. No invented rate:
+    load_head refuses to start with an unpriced model, so a sheet miss here is a bug."""
+    cost = usage.get("cost")
+    if cost is not None:
+        return float(cost), "openrouter"
+    pin, pout = prices[model]
+    return (int(usage.get("prompt_tokens") or 0) * pin
+            + int(usage.get("completion_tokens") or 0) * pout), "sheet"
 
 
 # ---- loading the trained artifact ---------------------------------------------
@@ -342,11 +356,18 @@ class Fugal:
         self.router = FugalRouter(mdir)
         self._rlock = threading.Lock()      # torch forward is not thread-safe
 
-    def _price(self, model, itok, otok):
-        # No fallback: load_head refuses to start with an unpriced model, so a miss
-        # here is a bug, not a condition to paper over with an invented rate.
-        pin, pout = self.prices[model]
-        return itok * pin + otok * pout
+    def _price(self, model, usage):
+        return call_cost(self.prices, model, usage)
+
+    def _charge(self, meta, model, usage):
+        """Record one worker call on meta: cost, its source, token totals, the step."""
+        c, src = self._price(model, usage)
+        meta["cost"] += c
+        meta["cost_source"] = src
+        meta["input_tokens"] += int(usage.get("prompt_tokens") or 0)
+        meta["output_tokens"] += int(usage.get("completion_tokens") or 0)
+        meta["steps"].append({"role": "worker", "model": model, "cost": c})
+        return c
 
     def route(self, query, history=None):
         """query -> (models ranked best-first, their p_solve in the same order).
@@ -381,7 +402,8 @@ class Fugal:
         # in/out token totals are accumulated alongside cost so the Anthropic-shaped
         # endpoint can report a real usage block instead of an estimate.
         sys_prompt = compose_system(system)
-        meta = {"cost": 0.0, "steps": [], "input_tokens": 0, "output_tokens": 0}
+        meta = {"cost": 0.0, "cost_source": None, "steps": [],
+                "input_tokens": 0, "output_tokens": 0}
         ranked, probs = self.route(
             route_on or query,
             history=history if self.head_context == "multiturn" else None)
@@ -405,21 +427,17 @@ class Fugal:
             # is the single system message rather than one of several the model may ignore.
             msgs = [{"role": "system", "content": sys_prompt}] \
                 + [m for m in base if m.get("role") != "system"]
-            msg, itok, otok = or_request(first, msgs, tools=tools, max_tokens=mtok,
-                                       temperature=temperature)
-            c = self._price(first, itok, otok); meta["cost"] += c
-            meta["input_tokens"] += itok; meta["output_tokens"] += otok
-            meta["steps"].append({"role": "worker", "model": first, "cost": c})
+            msg, usage = or_request(first, msgs, tools=tools, max_tokens=mtok,
+                                    temperature=temperature)
+            c = self._charge(meta, first, usage)
             meta["tool_calls"] = msg.get("tool_calls") or []
             yield {"stage": "worker", "model": first, "cost": c, "cost_total": meta["cost"]}
             yield {"stage": "final", "content": (msg.get("content") or ""), "meta": meta}
             return
 
-        reply, itok, otok = or_call(first, query, history=history, system=sys_prompt,
-                                    max_tokens=mtok, temperature=temperature)
-        c = self._price(first, itok, otok); meta["cost"] += c
-        meta["input_tokens"] += itok; meta["output_tokens"] += otok
-        meta["steps"].append({"role": "worker", "model": first, "cost": c})
+        reply, usage = or_call(first, query, history=history, system=sys_prompt,
+                               max_tokens=mtok, temperature=temperature)
+        c = self._charge(meta, first, usage)
         yield {"stage": "worker", "model": first, "cost": c, "cost_total": meta["cost"]}
         yield {"stage": "final", "content": reply, "meta": meta}
 

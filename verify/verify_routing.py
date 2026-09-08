@@ -37,7 +37,7 @@ def fake_or_call(model, prompt, max_tokens=4096, temperature=0.0, timeout=180,
     # that never reaches an assertion — which is exactly how an earlier guardrail test rotted.
     calls.append({"model": model, "prompt": prompt, "history": list(history or []),
                   "system": system})
-    return "mocked worker reply", 10, 5
+    return "mocked worker reply", {"prompt_tokens": 10, "completion_tokens": 5}
 
 
 def fake_or_request(*a, **kw):

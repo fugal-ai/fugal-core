@@ -1,10 +1,12 @@
-name: Price sync
+name: Price drift
 
-# The price sheet is the one input that goes stale on its own: providers move prices,
-# and a sheet that lags mis-counts every spend cap (and, with a v2 head, the routing
-# trade-off itself — docs/HEAD_FORMAT.md). This checks weekly and opens a PR when any
-# price moved past refresh_prices.py's default tolerance, so a human still reviews the
-# diff before it lands.
+# The price sheet is the one input that goes stale on its own. Billing no longer depends
+# on it — the spend caps count what OpenRouter reports it charged for each call — but
+# routing estimates (and, with a v2 head, the routing trade-off itself) still do. This
+# checks weekly and FAILS when any price moved past refresh_prices.py's tolerance, which
+# shows up as a red run and an email; the fix is `python scripts/refresh_prices.py` in a
+# normal PR. Deliberately not a bot PR: that needs an org-wide Actions permission and a
+# PR the CI workflow would not run on.
 
 on:
   schedule:
@@ -12,58 +14,19 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
-  refresh:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-
       - name: Install (numpy only — the script reads the head for its model list)
         run: pip install -q numpy
-
-      # --check exits 1 on drift. A network failure also exits nonzero, but then the
-      # rewrite step fails on the same fetch and no PR is opened — fail loud, not wrong.
+      # Exits 1 on drift or on a model that vanished from OpenRouter; a network failure
+      # also exits nonzero — fail loud, not wrong.
       - name: Check for drift
-        id: drift
-        run: |
-          if python scripts/refresh_prices.py --check; then
-            echo "drifted=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "drifted=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Rewrite the sheet
-        if: steps.drift.outputs.drifted == 'true'
-        run: python scripts/refresh_prices.py
-
-      # A PR opened with the workflow's own GITHUB_TOKEN does not trigger ci.yml (GitHub
-      # blocks that to prevent loops), so the checks that matter for a sheet change run
-      # here, on the rewritten file, before the PR exists.
-      - name: The head still loads against the new sheet
-        if: steps.drift.outputs.drifted == 'true'
-        run: |
-          python -c "import json; json.load(open('data/models_2026-06.json'))"
-          python verify/verify_head.py
-
-      - name: Open a PR with the new sheet
-        if: steps.drift.outputs.drifted == 'true'
-        uses: peter-evans/create-pull-request@v7
-        with:
-          commit-message: "Sync data/models_2026-06.json with OpenRouter"
-          title: "Price sheet drift: re-sync with OpenRouter"
-          body: |
-            `scripts/refresh_prices.py --check` found prices that moved past tolerance.
-            This PR is the output of running the refresh; the diff below is the whole
-            change. Merging keeps `meta.cost`, `X-Fugal-Cost-USD`, and the spend caps
-            counting real dollars (and, with a v2 head, keeps routing costs current).
-
-            `verify/verify_head.py` passed against the new sheet inside the workflow;
-            CI does not run on PRs opened by the workflow token.
-          branch: bot/price-sync
-          delete-branch: true
+        run: python scripts/refresh_prices.py --check

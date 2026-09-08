@@ -15,7 +15,7 @@ import unittest
 
 import numpy as np
 
-from fugal.router import load_head, load_prices
+from fugal.router import call_cost, load_head, load_prices
 
 
 def _make_head(tmp, n=3, dim=4, lam=2.0, v2=False, context=None, provenance=None):
@@ -96,13 +96,23 @@ class TestRouteFormula(unittest.TestCase):
         np.testing.assert_array_almost_equal(sub_p, full_p[idx])
 
 
-class TestPriceCalculation(unittest.TestCase):
+class TestCallCost(unittest.TestCase):
+    PRICES = {"test/m": (2.0 / 1e6, 6.0 / 1e6)}
 
-    def test_price_arithmetic(self):
-        prices = {"test/m": (2.0 / 1e6, 6.0 / 1e6)}
-        pin, pout = prices["test/m"]
-        cost = 1000 * pin + 500 * pout
+    def test_openrouter_charge_wins_when_present(self):
+        usage = {"prompt_tokens": 1000, "completion_tokens": 500, "cost": 0.0042}
+        self.assertEqual(call_cost(self.PRICES, "test/m", usage), (0.0042, "openrouter"))
+
+    def test_sheet_is_the_fallback(self):
+        cost, src = call_cost(self.PRICES, "test/m", {"prompt_tokens": 1000,
+                                                       "completion_tokens": 500})
         self.assertAlmostEqual(cost, 1000 * 2e-6 + 500 * 6e-6)
+        self.assertEqual(src, "sheet")
+        self.assertEqual(call_cost(self.PRICES, "test/m", {}), (0.0, "sheet"))
+
+    def test_unpriced_model_is_a_bug_not_a_guess(self):
+        with self.assertRaises(KeyError):
+            call_cost(self.PRICES, "not/priced", {"prompt_tokens": 1})
 
 
 class TestLoadHead(unittest.TestCase):

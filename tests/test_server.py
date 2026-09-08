@@ -18,6 +18,7 @@ import numpy as np
 from starlette.testclient import TestClient
 
 from fugal import serve as S
+from fugal.router import call_cost
 
 CHEAP, DEAR = "cheap/model", "dear/model"
 
@@ -34,9 +35,8 @@ class FakeFugal:
     def __init__(self, answer_cost=0.0123, tool_calls=None):
         self.answer_cost, self.tool_calls, self.calls = answer_cost, tool_calls, []
 
-    def _price(self, model, itok, otok):
-        pin, pout = self.prices[model]
-        return itok * pin + otok * pout
+    def _price(self, model, usage):
+        return call_cost(self.prices, model, usage)
 
     def route(self, query, history=None):
         self.calls.append(("route", query, history))
@@ -44,9 +44,9 @@ class FakeFugal:
 
     def answer(self, query, **kw):
         self.calls.append(("answer", query, kw))
-        meta = {"cost": self.answer_cost, "final_model": CHEAP, "p_solve": 0.9,
-                "ranked": [CHEAP, DEAR], "steps": [{"role": "worker", "model": CHEAP,
-                                                    "cost": self.answer_cost}],
+        meta = {"cost": self.answer_cost, "cost_source": "openrouter", "final_model": CHEAP,
+                "p_solve": 0.9, "ranked": [CHEAP, DEAR],
+                "steps": [{"role": "worker", "model": CHEAP, "cost": self.answer_cost}],
                 "input_tokens": 10, "output_tokens": 5}
         if self.tool_calls:
             meta["tool_calls"] = self.tool_calls
@@ -338,10 +338,25 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
         meta = chunks[-1]["fugal"]["meta"]
         self.assertEqual((meta["input_tokens"], meta["output_tokens"]), (100, 50))
-        # 100 * 1e-6 + 50 * 2e-6, charged to the meter exactly once
+        # No `cost` in usage -> the sheet: 100 * 1e-6 + 50 * 2e-6, charged exactly once
         self.assertAlmostEqual(meta["cost"], 0.0002)
+        self.assertEqual(meta["cost_source"], "sheet")
         self.assertEqual(c.get("/health").json(), {**c.get("/health").json(),
                                                    "queries": 1, "spend_usd": 0.0002})
+
+    def test_stream_counts_what_openrouter_charged_when_it_says(self):
+        # usage.cost is the provider's own figure; it beats the sheet estimate, and the
+        # spend cap counts it.
+        c, ev = self._openai(fake_upstream(usage={"prompt_tokens": 100, "completion_tokens": 50,
+                                                  "cost": 0.0077}))
+        meta = json.loads([d for _, d in ev if d != "[DONE]"][-1])["fugal"]["meta"]
+        self.assertEqual((meta["cost"], meta["cost_source"]), (0.0077, "openrouter"))
+        self.assertEqual(c.get("/health").json()["spend_usd"], 0.0077)
+
+    def test_worker_payload_requests_usage_accounting(self):
+        up = fake_upstream()
+        self._openai(up)
+        self.assertEqual(up.payloads[0]["usage"], {"include": True})
 
     def test_openai_stream_assembles_tool_call_fragments(self):
         deltas = [{"index": 0, "id": "call_1", "function": {"name": "grep", "arguments": '{"pa'}},
