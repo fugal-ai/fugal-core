@@ -102,6 +102,9 @@ jobs:
       - name: Fetch the backbone
         run: python scripts/fetch_backbone.py
 
+      - name: Success contract token and embedding conformance (no worker calls)
+        run: python verify/verify_success_contract.py
+
       # The product's core promise: one model call per turn, multi-turn included.
       # Mocked worker, so this spends nothing and needs no key.
       - name: Routing is one call per turn

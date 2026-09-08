@@ -38,6 +38,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from fugal import success_contract as success
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The backbone. scripts/fetch_backbone.py puts it in artifacts/; point FUGAL_MODEL at any
@@ -114,10 +116,16 @@ class FugalRouter:
     instead of an LLM call.
     """
 
-    def __init__(self, model_dir: str, dtype: str = "float32", device: str | None = None):
+    def __init__(self, model_dir: str, dtype: str = "float32", device: str | None = None,
+                 success_profile: bool = False):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
+        self.success_profile = success_profile
+        if success_profile:
+            if dtype != "float32" or device not in (None, "cpu"):
+                raise ValueError("success embeddings require CPU float32")
+            success.check_backbone(model_dir)
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         # transformers >=5 uses dtype=, <5 uses torch_dtype= — support both
         td = getattr(torch, dtype)
@@ -136,10 +144,18 @@ class FugalRouter:
 
     def hidden(self, messages: list[dict]):
         torch = self.torch
+        if self.success_profile:
+            return torch.from_numpy(self.embed_questions([messages[-1]["content"]])[0])
         ids = self.tok(self.format_transcript(messages), return_tensors="pt").to(self.device)
         with torch.no_grad():
             out = self.model.model(**ids)          # backbone only; LM head unused
         return out.last_hidden_state[0].mean(dim=0)
+
+
+    def embed_questions(self, questions, batch_size=8):
+        if not self.success_profile:
+            raise ValueError("batch embedding requires a success profile")
+        return success.embed(self.tok, self.model.model, questions, batch_size)
 
 
 # ---- the OpenRouter worker call ---------------------------------------------
@@ -280,7 +296,13 @@ def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
             f"router head missing: {head_path}\n"
             f"  Expected data/router_head.npz, or set FUGAL_HEAD to your own "
             f"(format: docs/HEAD_FORMAT.md).")
-    z = np.load(head_path)
+    with open(head_path, "rb") as head_file:
+        z = success.read_archive(head_file.read(success.MAX_BYTES + 1))
+    is_success = "contract" in z
+    if not is_success and ({"profile_id", "cost_profile_id"} & set(z)):
+        raise ValueError("success metadata requires an explicit contract version")
+    if is_success:
+        success.validate_head(z)
     all_models = [str(m) for m in z["models"]]
 
     sel = models if models is not None else os.environ.get("FUGAL_MODELS")
@@ -295,7 +317,8 @@ def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
                 + "\n    ".join(all_models)
                 + "\n  Routing to a model the head was not fit on is not possible; "
                   "see docs/HEAD_FORMAT.md.")
-        idx = [all_models.index(m) for m in sel]
+        idx = ([i for i, m in enumerate(all_models) if m in sel] if is_success
+               else [all_models.index(m) for m in sel])
     else:
         idx = list(range(len(all_models)))
     out_models = [all_models[i] for i in idx]
@@ -308,8 +331,13 @@ def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
             f"  Run `python scripts/refresh_prices.py` to re-sync the sheet, or exclude "
             f"the model(s) with --models / FUGAL_MODELS.")
 
-    fmt = "v2" if "mean_in_tokens" in z.files else "v1"
-    if fmt == "v2":
+    fmt = success.CONTRACT if is_success else ("v2" if "mean_in_tokens" in z else "v1")
+    if is_success:
+        # Price sheets are explicit inputs; refreshed prices can change selection.
+        subset = dict(z, models=z["models"][idx], mean_in_tokens=z["mean_in_tokens"][idx],
+                      mean_out_tokens=z["mean_out_tokens"][idx])
+        mean_cost = success.estimated_cost(subset, prices)
+    elif fmt == "v2":
         itok, otok = z["mean_in_tokens"][idx], z["mean_out_tokens"][idx]
         pin = np.array([prices[m][0] for m in out_models])
         pout = np.array([prices[m][1] for m in out_models])
@@ -323,8 +351,10 @@ def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
         lam = float(os.environ["FUGAL_LAMBDA"])
     else:
         lam = float(z["lam"])
+    if is_success and (not np.isfinite(lam) or lam < 0):
+        raise ValueError("lambda must be finite and nonnegative")
     def text(key):
-        return str(z[key]) if key in z.files else ""
+        return str(z[key]) if key in z else ""
     return Head(out_models, z["W"][idx], z["b"][idx], mean_cost, lam,
                 text("context") or "standalone", fmt,
                 text("backbone_revision"), text("provenance"))
@@ -353,7 +383,8 @@ class Fugal:
                 f"backbone not found: {mdir}\n"
                 f"  Fetch it once:  python scripts/fetch_backbone.py\n"
                 f"  Or point FUGAL_MODEL at an existing Qwen3-0.6B directory.")
-        self.router = FugalRouter(mdir)
+        self.router = (FugalRouter(mdir, success_profile=True)
+                       if self.head_format == success.CONTRACT else FugalRouter(mdir))
         self._rlock = threading.Lock()      # torch forward is not thread-safe
 
     def _price(self, model, usage):
@@ -375,11 +406,17 @@ class Fugal:
         "multiturn"); the shipped head was fit on standalone questions, and feeding
         it hidden states from a distribution it never saw routes worse, silently.
         answer_iter and the server gate this on the head's own declaration."""
+        if self.head_format == success.CONTRACT:
+            history = None
         msgs = [{"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                 *(history or []),
                 {"role": "user", "content": query}]
         with self._rlock:
             h = self.router.hidden(msgs).float().cpu().numpy()
+        if self.head_format == success.CONTRACT:
+            p = success.predictions(self.W, self.b, h)
+            order = success.rank(p, self.mean_cost, self.lam)
+            return [self.models[i] for i in order], p[order]
         h = h / max(np.linalg.norm(h), 1e-8)
         p = 1 / (1 + np.exp(-(self.W @ h + self.b)))
         util = p - self.lam * self.mean_cost

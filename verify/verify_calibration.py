@@ -123,7 +123,9 @@ def main():
                  f"checking the plumbing, never for quoting).")
 
     from fugal.router import Fugal, ROUTER_SYSTEM_PROMPT
+    from fugal import success_contract as success
     f2 = Fugal(router_lambda=args.router_lambda)
+    is_success = f2.head_format == success.CONTRACT
     # Same conditioning the live router uses. Reproduced here rather than calling route()
     # because we need the hidden state itself, not the ranking it produces.
     router_sys = ROUTER_SYSTEM_PROMPT
@@ -137,8 +139,10 @@ def main():
 
     # --- hidden states -> p_solve -------------------------------------------------
     cache_ok = args.cache and os.path.exists(args.cache)
-    if cache_ok:
-        cz = np.load(args.cache)
+    if cache_ok and is_success:
+        H = success.load_cache(args.cache, [q for q, _ in rows])
+    elif cache_ok:
+        cz = np.load(args.cache, allow_pickle=False)
         H = cz["H"]
         if len(H) != len(rows) or list(cz["questions"]) != [q for q, _ in rows]:
             sys.exit(f"{args.cache} does not match this fixture; delete it and re-run.")
@@ -150,18 +154,21 @@ def main():
                     {"role": "user", "content": q}]
             with f2._rlock:
                 h = f2.router.hidden(msgs).float().cpu().numpy()
-            H.append(h / max(np.linalg.norm(h), 1e-8))
+            H.append(h if is_success else h / max(np.linalg.norm(h), 1e-8))
             if i % 25 == 0 or i == len(rows):
                 el = time.time() - t0
                 print(f"  hidden states {i}/{len(rows)}  ({el:.0f}s, "
                       f"{el / i:.2f}s/question)", flush=True)
         H = np.asarray(H)
         if args.cache:
-            np.savez_compressed(args.cache, H=H, questions=[q for q, _ in rows])
+            if is_success:
+                success.save_cache(args.cache, [q for q, _ in rows], H)
+            else:
+                np.savez_compressed(args.cache, H=H, questions=[q for q, _ in rows])
             print(f"  cached to {args.cache}")
 
     idx = [models.index(m) for m in graded]
-    P = 1 / (1 + np.exp(-(H @ f2.W[idx].T + f2.b[idx])))          # (n_questions, n_graded)
+    P = success.predictions(f2.W[idx], f2.b[idx], H) if is_success else 1 / (1 + np.exp(-(H @ f2.W[idx].T + f2.b[idx])))          # (n_questions, n_graded)
     Y = np.array([[s[m] for m in graded] for _, s in rows], float)
     cost = np.asarray(mean_cost)[idx]
 
@@ -193,7 +200,7 @@ def main():
     # fixture, so it flatters itself and is the honest bar to clear: a router that cannot
     # beat one model picked in hindsight is not earning its forward pass.
     util = P - lam * cost
-    picked = np.argmax(util, axis=1)
+    picked = success.rank(P, cost, lam)[:, 0] if is_success else np.argmax(util, axis=1)
     routed_acc = float(Y[np.arange(len(rows)), picked].mean())
     routed_cost = float(cost[picked].mean())
 
