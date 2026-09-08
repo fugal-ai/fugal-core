@@ -1,15 +1,15 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/jtdoherty/fugal-core/security/advisories/new
+    url: https://github.com/fugal-ai/fugal-core/security/advisories/new
     about: >
       Report privately, not as a public issue. Fugal is a server holding a key that spends
       money — see SECURITY.md for the threat model and what is in scope.
   - name: "Question: can Fugal route to <some model>?"
-    url: https://github.com/jtdoherty/fugal-core/blob/main/docs/HEAD_FORMAT.md
+    url: https://github.com/fugal-ai/fugal-core/blob/main/docs/HEAD_FORMAT.md
     about: >
       Only the 17 models the head was fit on. A row of W is measured, not derived, and
       cannot be added by hand — HEAD_FORMAT.md explains what adding one actually takes.
   - name: "Question: how do I wire this into Claude Code / OpenClaw / an SDK?"
-    url: https://github.com/jtdoherty/fugal-core/blob/main/docs/INTEGRATION.md
+    url: https://github.com/fugal-ai/fugal-core/blob/main/docs/INTEGRATION.md
     about: Exact configuration for each, plus an honest list of what does not work.

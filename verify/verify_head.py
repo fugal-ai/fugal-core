@@ -74,6 +74,10 @@ n = len(models)
 context = str(z["context"]) if "context" in files else "standalone"
 check("context is a known value", context in ("standalone", "multiturn"),
       f"context={context!r}")
+rev = str(z["backbone_revision"]) if "backbone_revision" in files else ""
+check("backbone_revision, if declared, is a git commit hash",
+      rev == "" or (len(rev) == 40 and all(c in "0123456789abcdef" for c in rev)),
+      f"backbone_revision={rev!r}")
 
 # --- 2. every scored model can be billed -------------------------------------------
 # Unpriced is fatal at runtime: load_head refuses to start (a made-up rate would

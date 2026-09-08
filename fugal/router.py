@@ -34,6 +34,7 @@ substantially modified. See NOTICE.
 """
 from __future__ import annotations
 import json, os, random, threading, time
+from typing import NamedTuple
 
 import numpy as np
 
@@ -226,8 +227,21 @@ def load_prices(path):
     return prices, max_out
 
 
-def load_head(head_path, prices, models=None, router_lambda=None):
-    """The .npz head -> (models, W, b, mean_cost, lam, context, fmt). Pure numpy, no torch.
+class Head(NamedTuple):
+    """What load_head returns. Everything routing conditions on, plus where it came from."""
+    models: list
+    W: "np.ndarray"
+    b: "np.ndarray"
+    mean_cost: "np.ndarray"
+    lam: float
+    context: str                # "standalone" | "multiturn"
+    fmt: str                    # "v1" | "v2"
+    backbone_revision: str      # HF commit of the Qwen3-0.6B it was fit on, or ""
+    provenance: str             # free text: fit date, run id, training-code commit, or ""
+
+
+def load_head(head_path, prices, models=None, router_lambda=None) -> Head:
+    """The .npz head -> Head(models, W, b, mean_cost, lam, context, fmt, ...). Pure numpy.
 
     Two head formats (docs/HEAD_FORMAT.md), reported as fmt="v1" / "v2":
       v2 carries mean_in_tokens / mean_out_tokens — frozen MEASUREMENTS of how many
@@ -239,7 +253,9 @@ def load_head(head_path, prices, models=None, router_lambda=None):
 
     `context` declares what transcript distribution the head was fit on ("standalone"
     questions, the default, or "multiturn"); the caller feeds the router history only
-    when the head says it can use it.
+    when the head says it can use it. `backbone_revision` and `provenance` are optional
+    strings that say which backbone commit the head was fit on and where it came from;
+    scripts/fetch_backbone.py pins the download to the declared revision.
 
     lam resolution order: the router_lambda argument, then FUGAL_LAMBDA, then the
     head's trained default. A model with no entry in the price sheet is a hard error:
@@ -293,8 +309,11 @@ def load_head(head_path, prices, models=None, router_lambda=None):
         lam = float(os.environ["FUGAL_LAMBDA"])
     else:
         lam = float(z["lam"])
-    context = str(z["context"]) if "context" in z.files else "standalone"
-    return out_models, z["W"][idx], z["b"][idx], mean_cost, lam, context, fmt
+    def text(key):
+        return str(z[key]) if key in z.files else ""
+    return Head(out_models, z["W"][idx], z["b"][idx], mean_cost, lam,
+                text("context") or "standalone", fmt,
+                text("backbone_revision"), text("provenance"))
 
 
 # ---- the router: hidden state -> which model answers -------------------------
@@ -311,9 +330,9 @@ class Fugal:
 
     def __init__(self, models=None, router_lambda=None):
         self.prices, self.max_out_tokens = load_prices(PRICES)
-        (self.models, self.W, self.b, self.mean_cost, self.lam,
-         self.head_context, self.head_format) = load_head(HEAD, self.prices, models=models,
-                                                          router_lambda=router_lambda)
+        self.head = load_head(HEAD, self.prices, models=models, router_lambda=router_lambda)
+        self.models, self.W, self.b, self.mean_cost, self.lam = self.head[:5]
+        self.head_context, self.head_format = self.head.context, self.head.fmt
         mdir = os.environ["FUGAL_MODEL"]
         if not os.path.isdir(mdir):
             raise SystemExit(

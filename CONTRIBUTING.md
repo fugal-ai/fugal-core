@@ -34,8 +34,9 @@ than a chat template. Change any of it and routing quietly degrades with no erro
 the L2 normalisation of `h`.
 
 **The head and the backbone travel together.** `data/router_head.npz` was fit on unmodified
-`Qwen/Qwen3-0.6B` hidden states. A different or fine-tuned backbone does not crash; it just
-routes worse.
+`Qwen/Qwen3-0.6B` hidden states at the revision `scripts/fetch_backbone.py` pins. A different
+revision or a fine-tuned backbone does not crash; it just routes worse. `docs/HEAD_FORMAT.md`
+has the procedure for landing a new head.
 
 **Do not add a model to the head by hand.** A row of `W` is measured, not derived. See
 `docs/HEAD_FORMAT.md` for what adding one actually requires.

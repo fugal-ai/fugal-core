@@ -42,6 +42,15 @@ jobs:
         if: steps.drift.outputs.drifted == 'true'
         run: python scripts/refresh_prices.py
 
+      # A PR opened with the workflow's own GITHUB_TOKEN does not trigger ci.yml (GitHub
+      # blocks that to prevent loops), so the checks that matter for a sheet change run
+      # here, on the rewritten file, before the PR exists.
+      - name: The head still loads against the new sheet
+        if: steps.drift.outputs.drifted == 'true'
+        run: |
+          python -c "import json; json.load(open('data/models_2026-06.json'))"
+          python verify/verify_head.py
+
       - name: Open a PR with the new sheet
         if: steps.drift.outputs.drifted == 'true'
         uses: peter-evans/create-pull-request@v7
@@ -53,5 +62,8 @@ jobs:
             This PR is the output of running the refresh; the diff below is the whole
             change. Merging keeps `meta.cost`, `X-Fugal-Cost-USD`, and the spend caps
             counting real dollars (and, with a v2 head, keeps routing costs current).
+
+            `verify/verify_head.py` passed against the new sheet inside the workflow;
+            CI does not run on PRs opened by the workflow token.
           branch: bot/price-sync
           delete-branch: true

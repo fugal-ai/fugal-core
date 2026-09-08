@@ -1,6 +1,6 @@
 # Fugal
 
-[![CI](https://github.com/jtdoherty/fugal-core/actions/workflows/ci.yml/badge.svg)](https://github.com/jtdoherty/fugal-core/actions/workflows/ci.yml)
+[![CI](https://github.com/fugal-ai/fugal-core/actions/workflows/ci.yml/badge.svg)](https://github.com/fugal-ai/fugal-core/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
@@ -27,7 +27,7 @@ No API key, no account, nothing to sign up for. The router runs locally.
 
 ```bash
 pip install -e .                            # adds a `fugal` command; python -m fugal works too
-python scripts/fetch_backbone.py            # one-time: Qwen3-0.6B (~1.5 GB) -> artifacts/
+python scripts/fetch_backbone.py            # one-time: Qwen3-0.6B (~1.5 GB, pinned revision) -> artifacts/
 python -m fugal --route "what is 15% of 240?"
 ```
 
@@ -154,7 +154,8 @@ model landscape changes; forks drop in their own via `data/router_head.npz` or `
 **λ** (`--router-lambda` / `FUGAL_LAMBDA` overrides the head's default of 1.0; higher
 trades down to cheaper models on easy questions), and the **price sheet**
 (`scripts/refresh_prices.py` re-syncs it from OpenRouter). `FUGAL_MODEL` points at any
-Qwen3-0.6B checkout if you already have one and want to skip the download.
+Qwen3-0.6B checkout if you already have one and want to skip the download — at the
+revision the head declares (`docs/HEAD_FORMAT.md`), since the head was fit on those exact weights.
 
 ## What this does not claim
 

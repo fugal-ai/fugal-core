@@ -776,6 +776,9 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     print(f"Fugal serving on http://{host}:{port}/v1/chat/completions  [{auth}; {cap}; {pub}]")
     print(f"  routing among {len(f2.models)} models, lambda={f2.lam:g}, "
           f"head context={f2.head_context}, {fmt}")
+    if f2.head.provenance or f2.head.backbone_revision:
+        print(f"  head: {f2.head.provenance or '(no provenance)'}; backbone "
+              f"{f2.head.backbone_revision[:12] or 'revision not declared'}")
     print(f"  browser: CORS {'allowed for ' + ', '.join(cors) if cors else 'OFF'}; "
           f"Host check {'ON (' + ', '.join(hosts) + ')' if host in LOOPBACK else 'OFF (non-loopback bind)'}")
     if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):

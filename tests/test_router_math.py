@@ -18,7 +18,7 @@ import numpy as np
 from fugal.router import load_head, load_prices
 
 
-def _make_head(tmp, n=3, dim=4, lam=2.0, v2=False, context=None):
+def _make_head(tmp, n=3, dim=4, lam=2.0, v2=False, context=None, provenance=None):
     """Write a tiny synthetic head and price sheet for testing.
 
     v2=True writes mean_in_tokens/mean_out_tokens (docs/HEAD_FORMAT.md) instead of a
@@ -37,6 +37,9 @@ def _make_head(tmp, n=3, dim=4, lam=2.0, v2=False, context=None):
         arrays["mean_cost"] = mean_cost
     if context is not None:
         arrays["context"] = np.array(context)
+    if provenance:
+        arrays["backbone_revision"] = np.array("c" * 40)
+        arrays["provenance"] = np.array(provenance)
     np.savez(head_path, **arrays)
     prices = [{"id": m, "in": (i + 1) * 0.5, "out": (i + 1) * 1.5}
               for i, m in enumerate(models)]
@@ -142,6 +145,14 @@ class TestLoadHead(unittest.TestCase):
     def test_context_flag_is_read(self):
         head, prices_path, *_ = _make_head(self.tmp, context="multiturn")
         self.assertEqual(load_head(head, load_prices(prices_path)[0])[5], "multiturn")
+
+    def test_provenance_is_read_and_defaults_to_empty(self):
+        head, prices_path, *_ = _make_head(self.tmp, provenance="fit 2026-09-01 run 7")
+        h = load_head(head, load_prices(prices_path)[0])
+        self.assertEqual((h.backbone_revision, h.provenance), ("c" * 40, "fit 2026-09-01 run 7"))
+        head, prices_path, *_ = _make_head(self.tmp)
+        h = load_head(head, load_prices(prices_path)[0])
+        self.assertEqual((h.fmt, h.backbone_revision, h.provenance), ("v1", "", ""))
 
     def test_unpriced_model_is_a_hard_error(self):
         # Inventing a price would silently corrupt cost reports and spend caps.

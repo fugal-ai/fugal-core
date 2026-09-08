@@ -16,6 +16,10 @@ mean_in_tokens   (17,)       float64   mean input tokens per query, measured at 
 mean_out_tokens  (17,)       float64   mean output tokens per query, measured at fit time
 context          scalar      str       "standalone" (default when absent) or "multiturn"
 
+# optional provenance (any head)
+backbone_revision scalar     str       HuggingFace commit of the Qwen3-0.6B it was fit on
+provenance       scalar      str       free text: fit date, training run, code commit
+
 # v1 heads (the currently shipped head; supported, the server banner says so)
 mean_cost        (17,)       float64   mean USD per query, measured at fit-time PRICES
 ```
@@ -106,11 +110,42 @@ What it actually takes:
 Point `FUGAL_HEAD` at your `.npz` to serve it. That work lives in the research repository, not
 here.
 
+`backbone_revision` is what `scripts/fetch_backbone.py` downloads when the head declares
+it, so a head can bring its own backbone pin. `provenance` is printed by the server banner
+so a routing-quality report can say which head it was. Both are read with pickle disabled,
+like every other array: a head from a source you do not control cannot run code on load.
+
+## Shipping a new head
+
+Heads are trained outside this repo (the subnet), and this is the procedure for landing one
+here. Every step is mechanical except the last, which is the only one that tells you whether
+the head is any good.
+
+1. **Save it in the v2 format** with `context`, `backbone_revision` and `provenance` set. A
+   v1 head works, but freezes fit-time prices into every routing decision until replaced.
+2. **Drop it in** as `data/router_head.npz` (or point `FUGAL_HEAD` at it to try first).
+3. **Re-sync the price sheet**: `python scripts/refresh_prices.py`. The sheet must cover
+   every model the head scores or the server refuses to start; the model list is taken
+   from the head, so a head that adds or drops a model rewrites the sheet accordingly.
+4. **Check the artifact**: `python verify/verify_head.py` (CI runs this on every push, and
+   fails on a head the sheet does not cover).
+5. **Check the backbone pin**: if `backbone_revision` changed, `python
+   scripts/fetch_backbone.py` again — the CI cache key includes it.
+6. **Measure it**: `python verify/verify_calibration.py --fixture <held-out graded rows>`
+   and put the end-to-end table in the PR. The subnet grades model×question outcomes, so a
+   held-out fixture (`docs/EVALUATION.md`) is a by-product of training, not extra work.
+   Every documented example table (README, `docs/INTEGRATION.md`) must be regenerated
+   from real runs of the new head; `CONTRIBUTING.md` says why.
+
+For heads published more often than this repo releases, publish the `.npz` as a versioned
+release asset and point `FUGAL_HEAD` at it. Rolling back is pointing at the previous one.
+
 ## Two ways to silently break it
 
 **The head and the backbone travel together.** These weights were fit on hidden states from an
-unmodified `Qwen/Qwen3-0.6B`. Serve them on a different or fine-tuned backbone and nothing
-crashes — the router just routes worse, which is the worst failure mode available.
+unmodified `Qwen/Qwen3-0.6B` at one HuggingFace revision, which `scripts/fetch_backbone.py`
+pins. Serve them on a different revision or a fine-tuned backbone and nothing crashes — the
+router just routes worse, which is the worst failure mode available.
 
 **The prompt is part of the artifact.** The hidden state is taken with
 `ROUTER_SYSTEM_PROMPT` as the system message and the question as the user message, formatted

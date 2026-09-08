@@ -34,9 +34,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jtdoherty/fugal-core"
-Source = "https://github.com/jtdoherty/fugal-core"
-Issues = "https://github.com/jtdoherty/fugal-core/issues"
+Homepage = "https://github.com/fugal-ai/fugal-core"
+Source = "https://github.com/fugal-ai/fugal-core"
+Issues = "https://github.com/fugal-ai/fugal-core/issues"
 
 [project.scripts]
 fugal = "fugal.serve:main"
