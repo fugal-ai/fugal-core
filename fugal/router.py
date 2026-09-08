@@ -227,14 +227,15 @@ def load_prices(path):
 
 
 def load_head(head_path, prices, models=None, router_lambda=None):
-    """The .npz head -> (models, W, b, mean_cost, lam, context). Pure numpy, no torch.
+    """The .npz head -> (models, W, b, mean_cost, lam, context, fmt). Pure numpy, no torch.
 
-    Two head formats (docs/HEAD_FORMAT.md):
+    Two head formats (docs/HEAD_FORMAT.md), reported as fmt="v1" / "v2":
       v2 carries mean_in_tokens / mean_out_tokens — frozen MEASUREMENTS of how many
          tokens a query for each model averaged at fit time — and mean_cost is computed
          here from the CURRENT price sheet, so refresh_prices.py keeps routing honest.
       v1 carries a baked-in mean_cost, which freezes fit-time prices into every routing
-         decision. Supported, with a note, until a v2 head replaces it.
+         decision. Supported until a v2 head replaces it; the server banner says which
+         format is loaded.
 
     `context` declares what transcript distribution the head was fit on ("standalone"
     questions, the default, or "multiturn"); the caller feeds the router history only
@@ -277,17 +278,14 @@ def load_head(head_path, prices, models=None, router_lambda=None):
             f"  Run `python scripts/refresh_prices.py` to re-sync the sheet, or exclude "
             f"the model(s) with --models / FUGAL_MODELS.")
 
-    if "mean_in_tokens" in z.files:
+    fmt = "v2" if "mean_in_tokens" in z.files else "v1"
+    if fmt == "v2":
         itok, otok = z["mean_in_tokens"][idx], z["mean_out_tokens"][idx]
         pin = np.array([prices[m][0] for m in out_models])
         pout = np.array([prices[m][1] for m in out_models])
         mean_cost = itok * pin + otok * pout
     else:
         mean_cost = z["mean_cost"][idx]
-        # ASCII on purpose: load_head runs in library contexts where stdout may not be
-        # UTF-8 (use_utf8() is an entry-point-only affordance).
-        print("  note: v1 head - routing costs are frozen at fit time; a v2 head "
-              "(docs/HEAD_FORMAT.md) computes them from the current price sheet")
 
     if router_lambda is not None:
         lam = float(router_lambda)
@@ -296,7 +294,7 @@ def load_head(head_path, prices, models=None, router_lambda=None):
     else:
         lam = float(z["lam"])
     context = str(z["context"]) if "context" in z.files else "standalone"
-    return out_models, z["W"][idx], z["b"][idx], mean_cost, lam, context
+    return out_models, z["W"][idx], z["b"][idx], mean_cost, lam, context, fmt
 
 
 # ---- the router: hidden state -> which model answers -------------------------
@@ -313,9 +311,9 @@ class Fugal:
 
     def __init__(self, models=None, router_lambda=None):
         self.prices, self.max_out_tokens = load_prices(PRICES)
-        (self.models, self.W, self.b, self.mean_cost,
-         self.lam, self.head_context) = load_head(HEAD, self.prices, models=models,
-                                                  router_lambda=router_lambda)
+        (self.models, self.W, self.b, self.mean_cost, self.lam,
+         self.head_context, self.head_format) = load_head(HEAD, self.prices, models=models,
+                                                          router_lambda=router_lambda)
         mdir = os.environ["FUGAL_MODEL"]
         if not os.path.isdir(mdir):
             raise SystemExit(

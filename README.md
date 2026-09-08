@@ -26,34 +26,39 @@ Each row is an independent logistic head for one model. It is the only novel art
 No API key, no account, nothing to sign up for. The router runs locally.
 
 ```bash
-pip install -r requirements.txt             # or: pip install -e .   (adds a `fugal` command)
+pip install -e .                            # adds a `fugal` command; python -m fugal works too
 python scripts/fetch_backbone.py            # one-time: Qwen3-0.6B (~1.5 GB) -> artifacts/
 python -m fugal --route "what is 15% of 240?"
 ```
 
+(The router never needs a GPU. On Linux, `pip install torch --index-url
+https://download.pytorch.org/whl/cpu` *before* `pip install -e .` keeps you on the CPU wheel.)
+
 ```
   model                             p_solve   $/query  utility
-  qwen/qwen3.7-plus                   0.972   0.00439    0.964  ################### <-- WORKER
-  anthropic/claude-sonnet-5           0.974   0.00784    0.958  ###################
-  google/gemini-3.5-flash             0.958   0.01215    0.934  ###################
-  anthropic/claude-opus-4.8           0.950   0.00929    0.931  ##################
-  openai/gpt-5.5                      0.966   0.01965    0.927  ###################
-  mistralai/mistral-large-2512        0.922   0.00140    0.919  ##################
+  deepseek/deepseek-v4-flash          0.985   0.00026    0.984  ################### <-- WORKER
+  meta-llama/llama-4-maverick         0.983   0.00030    0.983  ###################
+  deepseek/deepseek-v4-pro            0.985   0.00154    0.981  ###################
+  openai/gpt-5.4-nano                 0.981   0.00055    0.980  ###################
+  mistralai/mistral-large-2512        0.980   0.00140    0.978  ###################
   ...
+  openai/gpt-5.5                      0.990   0.01965    0.950  ###################
+  google/gemini-3.1-pro-preview       0.994   0.02537    0.943  ###################
 ```
 
-Read the top two rows: Sonnet is marginally likelier to be right (0.974 vs 0.972) and costs
-79% more, so the cheaper model wins on utility. That trade is the product.
-
-Ask a harder question and the whole board moves down:
+Read the first and last rows: Gemini Pro is likelier to be right (0.994 vs 0.985) and costs
+a hundred times more per query, so the cheaper model wins on utility. That trade is the
+product. A harder question lowers every model's odds and widens the gaps between them:
 
 ```bash
 $ python -m fugal --route "prove that the halting problem is undecidable"
   model                             p_solve   $/query  utility
-  minimax/minimax-m3                  0.646   0.00193    0.642  ############ <-- WORKER
-  z-ai/glm-5.2                        0.624   0.00660    0.611  ############
-  anthropic/claude-sonnet-5           0.626   0.00784    0.610  ############
+  deepseek/deepseek-v4-flash          0.979   0.00026    0.978  ################### <-- WORKER
+  openai/gpt-5.4-nano                 0.976   0.00055    0.975  ###################
+  deepseek/deepseek-v4-pro            0.978   0.00154    0.975  ###################
 ```
+
+With the shipped head that move is small — see "What this does not claim" below.
 
 Bare `python -m fugal --route` opens an interactive inspector: type questions, see the table,
 `/quit` to leave. Still $0.
@@ -66,9 +71,9 @@ Most people hold keys for three or four providers, not seventeen. Restrict the p
 $ python -m fugal --models "openai/gpt-5.4-nano,deepseek/deepseek-v4-flash,meta-llama/llama-4-maverick" \
     --route "what is 15% of 240?"
   model                             p_solve   $/query  utility
-  deepseek/deepseek-v4-flash          0.897   0.00026    0.896  ################# <-- WORKER
-  meta-llama/llama-4-maverick         0.868   0.00030    0.867  #################
-  openai/gpt-5.4-nano                 0.864   0.00055    0.863  #################
+  deepseek/deepseek-v4-flash          0.985   0.00026    0.984  ################### <-- WORKER
+  meta-llama/llama-4-maverick         0.983   0.00030    0.983  ###################
+  openai/gpt-5.4-nano                 0.981   0.00055    0.980  ###################
 ```
 
 `FUGAL_MODELS="a,b,c"` does the same thing as an environment variable, including for the
@@ -120,9 +125,9 @@ page you happened to be visiting could spend your credit from your own machine. 
 
 ```
 fugal/router.py     the model: backbone -> hidden state -> head -> one worker call
-fugal/serve.py      the CLI and the HTTP server
+fugal/serve.py      the wire-shape adapters, the HTTP server (build_app) and the CLI
 data/router_head.npz        the trained head: W, b, models, costs, lam  (73 KB)
-data/models_2026-06.json    price sheet, USD per million tokens
+data/models_2026-06.json    price sheet, USD per million tokens, plus max output tokens
 docs/HEAD_FORMAT.md         the .npz contract, and the limits of subsetting
 docs/INTEGRATION.md         wiring Fugal into Claude Code / OpenClaw / SDKs
 docs/EVALUATION.md          how to check the head is any good, and what that needs
@@ -130,13 +135,16 @@ verify/verify_routing.py    the core promise: exactly one model call per turn
 verify/verify_head.py       head properties, pure numpy, no backbone, <1s
 verify/verify_calibration.py  is p_solve true? (needs a graded fixture — see EVALUATION.md)
 tests/test_adapters.py      the OpenAI/Anthropic wire-shape conversions
+tests/test_router_math.py   the decision rule and head loading, on a synthetic head
+tests/test_server.py        every endpoint, tier, stream shape and browser defence
+scripts/fetch_backbone.py   one-time download of Qwen3-0.6B
 scripts/refresh_prices.py   re-sync the price sheet with OpenRouter
 ```
 
 Everything above except the head and the price sheet is checkable on a fresh clone:
 
 ```bash
-python -m unittest discover -s tests    # milliseconds, no backbone, no network
+python -m unittest discover -s tests    # <1s, no backbone, no network
 python verify/verify_head.py            # <1s, no backbone, no network
 python verify/verify_routing.py         # needs the backbone; mocked worker, $0
 ```
@@ -164,6 +172,14 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
   `X-Fugal-Cost-USD` and the spend caps are computed from, so it should be current. Run
   `python scripts/refresh_prices.py` (or `--check`) to keep it that way; a stale sheet means
   your cap is counting the wrong dollars.
+- **On the shipped head, `p_solve` is high and nearly flat.** Across twelve deliberately
+  varied test questions (a greeting, arithmetic, a translation, a Byzantine-consensus
+  design, nonsense) every model scored between 0.91 and 0.997, and each model's score moved
+  by about 0.01 from question to question. At `λ=2.0` the price term is usually larger than
+  those gaps, so the cheapest capable models win most queries and the pricier ones win only
+  when the head sees a real difference. Whether that reflects the models or a weak head is
+  exactly what `verify/verify_calibration.py` measures — and it needs the graded fixture
+  described next.
 - **`ROUTER_SYSTEM_PROMPT` and mean-pooling are part of the trained artifact.** The head was
   fit on hidden states produced under that exact prompt, mean-pooled across all input tokens.
   Changing either silently invalidates the head. Both were chosen via a systematic ablation
@@ -180,7 +196,7 @@ Qwen3-0.6B checkout if you already have one and want to skip the download.
 
 ## License
 
-Apache-2.0 (see `LICENSE`). The router's hidden-state extraction path is inspired by
-[TRINITY](https://arxiv.org/abs/2512.04695) — see `NOTICE` for full attribution. The backbone
-(Qwen3-0.6B, Apache-2.0) is fetched at setup time and never redistributed here. The router
-head is original work and ships with the repo under the same licence.
+Apache-2.0 (see `LICENSE`). The hidden-state extraction path derives from Apache-2.0 work
+credited in `NOTICE`. The backbone (Qwen3-0.6B, Apache-2.0) is fetched at setup time and
+never redistributed here. The router head is original work and ships with the repo under
+the same licence.

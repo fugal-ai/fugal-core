@@ -10,8 +10,8 @@ produces a response an agent harness quietly mishandles. The comments in serve.p
 name the two that already bit: a dropped `tool_call_id` breaks a tool loop with no
 error, and a system prompt faked as a user turn reads to the worker as conversation.
 
-Importing fugal.serve pulls in numpy (via router.py) but NOT torch, transformers or
-requests — those are imported lazily at the point of use.
+Importing fugal.serve pulls in numpy, starlette and httpx but NOT torch or transformers —
+those are imported lazily, when a backbone is actually loaded.
 """
 import json
 import unittest

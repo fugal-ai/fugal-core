@@ -66,7 +66,7 @@ def ece(p, y, bins=10):
     """Expected calibration error + the reliability table it is computed from."""
     edges = np.linspace(0, 1, bins + 1)
     rows, total, err = [], len(p), 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
+    for lo, hi in zip(edges[:-1], edges[1:], strict=True):
         m = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
         if not m.any():
             continue

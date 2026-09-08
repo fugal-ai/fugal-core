@@ -17,16 +17,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: All Python compiles
-        run: python -m compileall -q fugal scripts verify tests
+      - name: Install (no torch — nothing in this job loads the backbone)
+        run: pip install -q numpy starlette uvicorn httpx ruff
 
-      # Milliseconds, no backbone, no network: the wire-shape adapters are pure functions,
-      # and they are where a bug does NOT raise — a dropped tool_call_id just hangs a tool
-      # loop. numpy is the only dependency reaching them (via router.py).
-      - name: Wire-shape adapter tests
-        run: |
-          pip install -q numpy starlette uvicorn httpx
-          python -m unittest discover -s tests -v
+      - name: Lint (the rules in pyproject.toml)
+        run: ruff check .
+
+      # Under a second, no backbone, no network: the wire-shape adapters, the decision rule
+      # on a synthetic head, and the whole server through build_app() with a fake router —
+      # auth, caps, rate limits, both streaming shapes, CORS and the Host check.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
 
       - name: Head properties (pure numpy, no backbone)
         run: python verify/verify_head.py

@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Actions only. Python dependencies are deliberately loose in requirements.txt (a CPU
+  # Actions only. Python dependencies are deliberately loose in pyproject.toml (a CPU
   # torch wheel is picked per-platform at install time), so a bot pinning them would create
   # churn without making anything more reproducible.
   - package-ecosystem: "github-actions"

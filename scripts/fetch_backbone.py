@@ -30,7 +30,7 @@ def main():
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        sys.exit("pip install -r requirements.txt   (huggingface_hub is needed to fetch)")
+        sys.exit("pip install -e .   (huggingface_hub is needed to fetch)")
 
     os.makedirs(ART, exist_ok=True)
     print(f"fetching {MODEL_ID} (Apache-2.0, ~1.5 GB) -> {DEST}")

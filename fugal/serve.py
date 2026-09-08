@@ -20,13 +20,28 @@ useful when you hold keys for some providers and not others. See docs/HEAD_FORMA
 
 Env: FUGAL_API_KEY (OpenRouter, live calls only), FUGAL_MODEL (backbone directory),
 FUGAL_HEAD (your own head), FUGAL_LAMBDA (cost sensitivity), FUGAL_MODELS (subset).
+
+Layout: the wire-shape adapters are pure functions (tests/test_adapters.py); build_app()
+turns a Fugal into an ASGI app and takes every policy knob as an argument, which is what
+lets tests/test_server.py drive every endpoint with a fake router and no backbone; serve()
+is build_app() plus uvicorn.
 """
 from __future__ import annotations
-import argparse, asyncio, hmac, json, os, sys, time, uuid
+import argparse, asyncio, hmac, json, os, sys, time, traceback, uuid
+from collections import deque
+from datetime import datetime, timezone
+
+import httpx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Route
 
 from . import use_utf8
-from .router import (Fugal, clamp_max_tokens, compose_system,                    # noqa: F401
-                     or_request, or_call, OR_URL)
+from .router import Fugal, clamp_max_tokens, compose_system, OR_URL
+
+MAX_BODY = 256 * 1024
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 def client_system_from_body(body):
@@ -216,9 +231,9 @@ def routing_query(messages, fallback=""):
 def print_ranking(f2, query):
     """The ranked table. Local forward pass only — no API call, no key, no spend."""
     ranked, probs = f2.route(query)
-    mc = {m: c for m, c in zip(f2.models, f2.mean_cost)}
+    mc = dict(zip(f2.models, f2.mean_cost, strict=True))
     print(f"  {'model':<32} {'p_solve':>8} {'$/query':>9} {'utility':>8}")
-    for i, (m, p) in enumerate(zip(ranked, probs)):
+    for i, (m, p) in enumerate(zip(ranked, probs, strict=True)):
         bar = "#" * int(p * 20)
         mark = " <-- WORKER" if i == 0 else ""
         print(f"  {m:<32} {p:>8.3f} {mc[m]:>9.5f} {p - f2.lam * mc[m]:>8.3f}  {bar}{mark}")
@@ -242,41 +257,95 @@ def route_repl(models=None, router_lambda=None):
     print("bye")
 
 
-# ---- the async server --------------------------------------------------------
-def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
-          router_lambda=None, models=None, cors_origins=None, allow_hosts=None):
-    """OpenAI- and Anthropic-compatible async endpoint with real streaming.
+# ---- streaming from the worker -----------------------------------------------
+class StreamAccount:
+    """What one streamed worker call accumulates as chunks arrive: the usage block
+    (OpenRouter sends it in its LAST chunk) and tool-call fragments, which stream as
+    index-keyed deltas that must be concatenated before a client can act on them."""
 
-    Backed by Starlette + uvicorn. Real SSE streaming from OpenRouter via httpx so
-    clients see tokens as they arrive. Routing (the torch forward pass) runs in a
-    thread pool so it never blocks the event loop.
+    def __init__(self):
+        self.usage = {}
+        self.settled = False
+        self._tcalls = {}
+
+    def add_tool_delta(self, tc):
+        idx = tc.get("index", 0)
+        cur = self._tcalls.setdefault(idx, {"id": "", "type": "function",
+                                            "function": {"name": "", "arguments": ""}})
+        if tc.get("id"):
+            cur["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            cur["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            cur["function"]["arguments"] += fn["arguments"]
+
+    def tool_calls(self):
+        return [self._tcalls[i] for i in sorted(self._tcalls)]
+
+
+async def worker_stream(payload, acct):
+    """POST `payload` to OpenRouter with stream=True and yield text deltas as they arrive.
+    Tool-call fragments and the usage block accumulate on `acct`. An upstream or transport
+    failure is yielded as bracketed text, so the client sees what happened inline instead of
+    a stream that just stops. Module-level so tests can substitute a fake upstream."""
+    key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    try:
+        async with httpx.AsyncClient() as client, client.stream(
+                "POST", OR_URL, json=payload, timeout=180.0,
+                headers={"Authorization": f"Bearer {key}"}) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode(errors="replace")[:200]
+                yield f"[upstream error {response.status_code}: {body}]"
+                return
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    acct.usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    yield delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    acct.add_tool_delta(tc)
+    except Exception as exc:
+        yield f"\n\n[stream error: {str(exc)[:100]}]"
+
+
+# ---- the app -----------------------------------------------------------------
+def build_app(f2, *, host="127.0.0.1", token=None, spend_cap=None, daily_cap=None,
+              rate_limit=6, cors_origins=None, allow_hosts=None):
+    """OpenAI- and Anthropic-compatible ASGI app over one router.
 
     Every request is routed to ONE model and that model's answer is returned, once —
-    streaming, tool calling and multi-turn included.
+    streaming, tool calling and multi-turn included. Routing (the torch forward pass)
+    runs in a thread so it never blocks the event loop; worker streams are relayed from
+    OpenRouter as they arrive.
 
     Tiers:
       - POST /v1/route — $0 local forward pass only, no token needed, rate-limited.
       - POST /v1/chat/completions | /v1/messages without a token — allowed ONLY when
-        --daily-cap is set; counts against a per-UTC-day budget + per-IP rate limit.
-      - With the FUGAL_SERVE_TOKEN bearer — bypasses the daily cap and rate limit
-        (still bounded by the cumulative --spend-cap safety net).
+        daily_cap is set; counts against a per-UTC-day budget + per-IP rate limit.
+      - With the `token` bearer — bypasses the daily cap and rate limit (still bounded
+        by the cumulative spend_cap safety net).
 
     Browser defences, both ON by default:
       - No CORS headers unless an origin is explicitly allowed.
-      - When bound to loopback, the Host header must name loopback."""
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response, StreamingResponse
-    from starlette.routing import Route
-    from collections import deque
-    from datetime import datetime, timezone
-    import httpx
-
-    f2 = Fugal(models=models, router_lambda=router_lambda)
-    token = os.environ.get("FUGAL_SERVE_TOKEN")
+      - When `host` is loopback, the Host header must name loopback."""
     cors = set(cors_origins or [])
-    loopback_bind = host in ("127.0.0.1", "localhost", "::1")
-    hosts_ok = {"localhost", "127.0.0.1", "::1"} | {h.lower() for h in (allow_hosts or [])}
+    loopback_bind = host in LOOPBACK
+    hosts_ok = LOOPBACK | {h.lower() for h in (allow_hosts or [])}
     # The meter is touched ONLY from the event loop, by functions that never await, so
     # every read-modify-write is atomic with respect to other coroutines — no lock. This
     # is load-bearing: add_spend must also be callable from a generator's cleanup path
@@ -284,13 +353,9 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
     meter = {"spent": 0.0, "n": 0, "day": None, "day_spent": 0.0}
     hits: dict[str, deque] = {}
     hits_lock = asyncio.Lock()
-    MAX_BODY = 256 * 1024
-
-    def utc_day():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def _day_spent():
-        d = utc_day()
+        d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if meter["day"] != d:
             meter["day"], meter["day_spent"] = d, 0.0
         return meter["day_spent"]
@@ -302,12 +367,14 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             _day_spent()
             meter["day_spent"] += cost
 
+    def capped():
+        return spend_cap is not None and meter["spent"] >= spend_cap
+
     async def rate_limited(ip, limit=rate_limit, window=60.0):
         now = time.time()
         async with hits_lock:
             if len(hits) > 10000:
-                stale = [k for k, dq in hits.items() if not dq or now - dq[-1] > window]
-                for k in stale:
+                for k in [k for k, dq in hits.items() if not dq or now - dq[-1] > window]:
                     del hits[k]
             dq = hits.setdefault(ip, deque())
             while dq and now - dq[0] > window:
@@ -327,25 +394,20 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             return {"access-control-allow-origin": origin, "vary": "Origin"}
         return {}
 
-    def _json(code, obj, request, extra_headers=None):
-        hdrs = {"connection": "close"}
-        if extra_headers:
-            hdrs.update(extra_headers)
-        return JSONResponse(obj, status_code=code, headers=hdrs)
+    def _json(code, obj, extra_headers=None):
+        return JSONResponse(obj, status_code=code,
+                            headers={"connection": "close", **(extra_headers or {})})
 
-    def _err(code, msg, request, typ="invalid_request_error"):
-        return _json(code, {"error": {"message": msg, "type": typ}}, request)
-
-    def auth_value(request):
-        h = request.headers.get("authorization", "")
-        if h.startswith("Bearer "):
-            return h[7:].strip()
-        return (request.headers.get("x-api-key") or "").strip()
+    def _err(code, msg, typ="invalid_request_error"):
+        return _json(code, {"error": {"message": msg, "type": typ}})
 
     def authed(request):
         if not token:
             return True
-        return hmac.compare_digest(auth_value(request), token)
+        h = request.headers.get("authorization", "")
+        given = h[7:].strip() if h.startswith("Bearer ") else \
+            (request.headers.get("x-api-key") or "").strip()
+        return hmac.compare_digest(given, token)
 
     def client_ip(request):
         peer = request.client.host if request.client else "127.0.0.1"
@@ -355,8 +417,16 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 return xff.split(",")[0].strip()
         return peer
 
-    def capped():
-        return spend_cap is not None and meter["spent"] >= spend_cap
+    async def read_json(request):
+        """-> (parsed body, None) or (None, error response). Bounded by Content-Length
+        before a byte of body is read; a chunked request with no length is refused too."""
+        n = int(request.headers.get("content-length") or 0)
+        if n <= 0 or n > MAX_BODY:
+            return None, _err(400, "empty or oversized request body")
+        try:
+            return await request.json(), None
+        except Exception:
+            return None, _err(400, "body must be valid JSON")
 
     def read_body(raw, anthropic=False):
         """-> (worker query, routing query, body). The worker query is the last message
@@ -382,50 +452,52 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             raise ValueError("query must be a non-empty string")
         return q, routing_query(body.get("messages"), fallback=q), body
 
-    def _build_or_messages(q, hist, tools, msgs, sys_prompt):
+    def worker_messages(q, hist, tools, msgs, sys_prompt):
+        """The message list the worker sees. With tools, the client's list goes through
+        verbatim (tool_call_id linkage must survive); the house prompt leads either way and
+        any stray system turns are dropped so there is exactly one system message."""
         if tools:
-            base = msgs if msgs is not None else (
-                list(hist or []) + [{"role": "user", "content": q}])
+            base = msgs if msgs is not None else list(hist or []) + [{"role": "user", "content": q}]
             return [{"role": "system", "content": sys_prompt}] \
                 + [m for m in base if m.get("role") != "system"]
-        return ([{"role": "system", "content": sys_prompt}]
-                + list(hist or [])
-                + [{"role": "user", "content": q}])
+        return [{"role": "system", "content": sys_prompt}, *(hist or []),
+                {"role": "user", "content": q}]
+
+    def log(kind, meta, public, hist):
+        print(f"[serve] {kind}  worker={meta['final_model']}  ${meta['cost']:.5f}  "
+              f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
+              f"tier={'public' if public else 'full'}", flush=True)
 
     # ---- route handlers ----------------------------------------------------------
 
     async def health(request):
         ds = _day_spent()
-        m = dict(meter)
-        return _json(200, {"status": "ok", "queries": m["n"],
-                           "spend_usd": round(m["spent"], 5),
+        return _json(200, {"status": "ok", "queries": meter["n"],
+                           "spend_usd": round(meter["spent"], 5),
                            "spend_cap_usd": spend_cap,
                            "daily_cap_usd": daily_cap,
-                           "day_spent_usd": round(ds, 5)}, request)
+                           "day_spent_usd": round(ds, 5)})
 
     async def models_list(request):
         return _json(200, {"object": "list", "data": [
             {"id": "fugal/auto", "object": "model", "owned_by": "fugal",
              "description": "Routes each request to the model with the best "
-                            "odds-vs-price trade for that question."}]}, request)
+                            "odds-vs-price trade for that question."}]})
 
     async def route_only(request):
         if await rate_limited("r|" + client_ip(request), limit=max(rate_limit * 2, 12)):
-            return _err(429, "rate limit exceeded; try again in a minute",
-                        request, "rate_limit_error")
-        try:
-            raw = await request.json()
-        except Exception:
-            return _err(400, "body must be valid JSON", request)
+            return _err(429, "rate limit exceeded; try again in a minute", "rate_limit_error")
+        raw, err = await read_json(request)
+        if err:
+            return err
         try:
             _, rq, _ = read_body(raw)
         except Exception:
-            return _err(400, "body must be JSON with messages[].content or a query field",
-                        request)
+            return _err(400, "body must be JSON with messages[].content or a query field")
         if len(rq) > 8000:
-            return _err(400, "query too long for the router (8000 chars max)", request)
+            return _err(400, "query too long for the router (8000 chars max)")
         ranked, probs = await asyncio.to_thread(f2.route, rq)
-        mc = {m: float(c) for m, c in zip(f2.models, f2.mean_cost)}
+        mc = {m: float(c) for m, c in zip(f2.models, f2.mean_cost, strict=True)}
         return _json(200, {
             "object": "fugal.route",
             "worker": ranked[0], "p_solve": round(float(probs[0]), 4),
@@ -433,43 +505,40 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
             "ranked": [{"model": m, "p_solve": round(float(p), 4),
                         "est_cost_usd": round(mc[m], 6),
                         "utility": round(float(p) - f2.lam * mc[m], 4)}
-                       for m, p in zip(ranked, probs)]}, request)
+                       for m, p in zip(ranked, probs, strict=True)]})
 
-    async def _do_completions(request, anthropic=False):
-        """Shared handler for OpenAI and Anthropic wire shapes."""
+    async def completions(request, anthropic):
+        """Shared handler for the OpenAI and Anthropic wire shapes."""
         public = not authed(request)
         req_id = "req_" + uuid.uuid4().hex[:20]
         if public:
             if daily_cap is None:
-                return _err(401, "missing or invalid bearer token",
-                            request, "authentication_error")
+                return _err(401, "missing or invalid bearer token", "authentication_error")
             if await rate_limited("c|" + client_ip(request)):
                 return _err(429, "rate limit exceeded; try again in a minute",
-                            request, "rate_limit_error")
+                            "rate_limit_error")
             if _day_spent() >= daily_cap:
                 return _err(402, "the daily budget is used up — resets at midnight UTC; "
                                  "route-only mode (POST /v1/route) stays free",
-                            request, "spend_cap_error")
-        n = int(request.headers.get("content-length") or 0)
-        if n <= 0 or n > MAX_BODY:
-            return _err(400, "empty or oversized request body", request)
-        try:
-            raw = await request.json()
-        except Exception:
-            return _err(400, "body must be valid JSON", request)
+                            "spend_cap_error")
+        if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):
+            return _err(503, "no OpenRouter key configured (set FUGAL_API_KEY); "
+                             "POST /v1/route works without one", "server_error")
+        raw, err = await read_json(request)
+        if err:
+            return err
         try:
             q, rq, body = read_body(raw, anthropic=anthropic)
         except Exception:
-            return _err(400, "body must be JSON with messages[].content or a query field",
-                        request)
+            return _err(400, "body must be JSON with messages[].content or a query field")
         if public and len(q) > 4000:
-            return _err(400, "query too long for the public tier (4000 chars max)", request)
+            return _err(400, "query too long for the public tier (4000 chars max)")
         if capped():
             return _err(402, f"spend cap ${spend_cap} reached; restart to reset",
-                        request, "spend_cap_error")
+                        "spend_cap_error")
 
-        hist = (clean_history(body, max_msgs=8, max_chars=8000) if public
-                else clean_history(body))
+        hist = clean_history(body, max_msgs=8, max_chars=8000) if public \
+            else clean_history(body)
         tools = body.get("tools") or None
         msgs = body.get("messages") if tools else None
         csys = client_system_from_body(body)
@@ -484,346 +553,143 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 temp = None
 
         if body.get("stream"):
-            if anthropic:
-                return StreamingResponse(
-                    _stream_anthropic(q, rq, public, hist, tools, msgs, csys, mtok, req_id,
-                                      temperature=temp),
-                    media_type="text/event-stream",
-                    headers={"cache-control": "no-cache", "connection": "close"})
-            return StreamingResponse(
-                _stream_openai(q, rq, public, hist, tools, msgs, csys, mtok,
-                               temperature=temp),
-                media_type="text/event-stream",
-                headers={"cache-control": "no-cache", "connection": "close"})
+            gen = (stream_anthropic if anthropic else stream_openai)(
+                q, rq, public, hist, tools, msgs, csys, mtok, temp)
+            return StreamingResponse(gen, media_type="text/event-stream",
+                                     headers={"cache-control": "no-cache",
+                                              "connection": "close"})
 
         reply, meta = await asyncio.to_thread(
             f2.answer, q, history=hist, tools=tools, messages=msgs,
             system=csys, max_tokens=mtok, temperature=temp, route_on=rq)
         add_spend(meta["cost"], public)
-
+        log("ok", meta, public, hist)
         extra = {"x-fugal-cost-usd": f"{meta['cost']:.6f}"}
         if anthropic:
-            return _json(200, anthropic_response(req_id, reply, meta), request,
-                         extra_headers=extra)
+            return _json(200, anthropic_response(req_id, reply, meta), extra)
         tcalls = meta.get("tool_calls") or []
         message = {"role": "assistant", "content": reply or None}
         if tcalls:
             message["tool_calls"] = tcalls
-        resp = {"id": req_id, "object": "chat.completion",
-                "model": f"fugal/{meta['final_model']}",
-                "choices": [{"index": 0,
-                             "finish_reason": "tool_calls" if tcalls else "stop",
-                             "message": message}],
-                "fugal": meta}
-        result = _json(200, resp, request, extra_headers=extra)
-        print(f"[serve] ok  worker={meta['final_model']}  ${meta['cost']:.5f}  "
-              f"p_solve={meta.get('p_solve', 0):.2f}  "
-              f"hist={len(hist)}  tier={'public' if public else 'full'}", flush=True)
-        return result
+        return _json(200, {"id": req_id, "object": "chat.completion",
+                           "model": f"fugal/{meta['final_model']}",
+                           "choices": [{"index": 0,
+                                        "finish_reason": "tool_calls" if tcalls else "stop",
+                                        "message": message}],
+                           "fugal": meta}, extra)
+
+    async def guarded(request, anthropic):
+        try:
+            return await completions(request, anthropic)
+        except Exception as e:
+            traceback.print_exc()
+            return _err(500, f"internal error: {str(e)[:120]}", "server_error")
 
     async def chat_completions(request):
-        try:
-            return await _do_completions(request, anthropic=False)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            try:
-                return _err(500, f"internal error: {str(e)[:120]}", request, "server_error")
-            except Exception:
-                return Response(status_code=500)
+        return await guarded(request, anthropic=False)
 
     async def messages(request):
-        try:
-            return await _do_completions(request, anthropic=True)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            try:
-                return _err(500, f"internal error: {str(e)[:120]}", request, "server_error")
-            except Exception:
-                return Response(status_code=500)
+        return await guarded(request, anthropic=True)
 
-    # ---- real streaming ----------------------------------------------------------
+    # ---- streaming ---------------------------------------------------------------
+    # Both wire shapes share one upstream: route, open the worker stream, relay text as it
+    # arrives, then settle. Only the SSE framing differs.
 
-    async def _stream_openai(q, rq, public, hist, tools, msgs, csys, mtok, temperature=None):
-        """Real SSE streaming for the OpenAI wire shape via httpx."""
+    async def open_stream(q, rq, hist, tools, msgs, csys, mtok, temperature):
+        """Route once and build the worker payload. -> (model, meta, payload, acct)."""
         ranked, probs = await asyncio.to_thread(
             f2.route, rq, history=hist if f2.head_context == "multiturn" else None)
         first = ranked[0]
-        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
                 "final_model": first, "cost": 0.0, "steps": [],
                 "input_tokens": 0, "output_tokens": 0}
-        accumulated_tcalls = {}
-        usage = {}
-        settled = False
+        payload = {"model": first,
+                   "max_tokens": clamp_max_tokens(mtok, f2.max_out_tokens.get(first)),
+                   "messages": worker_messages(q, hist, tools, msgs, compose_system(csys)),
+                   "stream": True, "stream_options": {"include_usage": True}}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if tools:
+            payload["tools"] = tools
+        return first, meta, payload, StreamAccount()
 
-        def settle():
-            # Runs exactly once: on the normal path, AND from `finally` when the client
-            # disconnects mid-stream (Starlette closes the generator), so streamed spend
-            # still counts against the caps. usage is OpenRouter's LAST chunk, so a very
-            # early disconnect can still under-count — the hard limit on the OpenRouter
-            # key itself remains the outermost brake (SECURITY.md).
-            nonlocal settled
-            if settled:
-                return
-            settled = True
-            itok = int(usage.get("prompt_tokens", 0))
-            otok = int(usage.get("completion_tokens", 0))
-            cost = f2._price(first, itok, otok)
-            meta["cost"] = cost
-            meta["input_tokens"] = itok
-            meta["output_tokens"] = otok
-            meta["steps"].append({"role": "worker", "model": first, "cost": cost})
-            add_spend(cost, public)
-            print(f"[serve] stream ok  worker={first}  ${cost:.5f}  "
-                  f"p_solve={meta.get('p_solve', 0):.2f}  hist={len(hist or [])}  "
-                  f"tier={'public' if public else 'full'}", flush=True)
+    def settle(acct, meta, public, hist, kind):
+        """Charge the meter for a stream, exactly once: on the normal path, AND from
+        `finally` when the client disconnects mid-stream (Starlette closes the generator),
+        so streamed spend still counts against the caps. usage is OpenRouter's LAST chunk,
+        so a very early disconnect can still under-count — the hard limit on the OpenRouter
+        key itself remains the outermost brake (SECURITY.md)."""
+        if acct.settled:
+            return
+        acct.settled = True
+        itok = int(acct.usage.get("prompt_tokens", 0))
+        otok = int(acct.usage.get("completion_tokens", 0))
+        cost = f2._price(meta["final_model"], itok, otok)
+        meta.update(cost=cost, input_tokens=itok, output_tokens=otok)
+        meta["steps"].append({"role": "worker", "model": meta["final_model"], "cost": cost})
+        tcalls = acct.tool_calls()
+        if tcalls:
+            meta["tool_calls"] = tcalls
+        add_spend(cost, public)
+        log(kind, meta, public, hist)
 
-        def sse(obj):
-            return f"data: {json.dumps(obj)}\n\n".encode()
+    async def stream_openai(q, rq, public, hist, tools, msgs, csys, mtok, temperature):
+        first, meta, payload, acct = await open_stream(q, rq, hist, tools, msgs, csys, mtok,
+                                                       temperature)
 
+        def sse(delta, finish=None, **extra):
+            return (f"data: " + json.dumps({
+                "id": cid, "object": "chat.completion.chunk", "model": f"fugal/{first}",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                **extra}) + "\n\n").encode()
+
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         try:
-            yield sse({"id": cid, "object": "chat.completion.chunk",
-                       "model": f"fugal/{first}",
-                       "choices": [{"index": 0,
-                                    "delta": {"role": "assistant", "content": ""},
-                                    "finish_reason": None}],
-                       "fugal": {"stage": "route", "model": first,
-                                 "p_solve": float(probs[0])}})
-
-            sys_prompt = compose_system(csys)
-            mtok_val = clamp_max_tokens(mtok, f2.max_out_tokens.get(first))
-            or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
-            key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-            payload = {"model": first, "max_tokens": mtok_val,
-                       "messages": or_msgs, "stream": True,
-                       "stream_options": {"include_usage": True}}
-            if temperature is not None:
-                payload["temperature"] = temperature
-            if tools:
-                payload["tools"] = tools
-
-            try:
-                async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        "POST", OR_URL, json=payload, timeout=180.0,
-                        headers={"Authorization": f"Bearer {key}",
-                                 "Content-Type": "application/json"},
-                    ) as response:
-                        if response.status_code != 200:
-                            body = (await response.aread()).decode(errors="replace")[:200]
-                            yield sse({"id": cid, "object": "chat.completion.chunk",
-                                       "model": f"fugal/{first}",
-                                       "choices": [{"index": 0,
-                                                    "delta": {"content": f"[upstream error {response.status_code}: {body}]"},
-                                                    "finish_reason": None}]})
-                            yield sse({"id": cid, "object": "chat.completion.chunk",
-                                       "model": f"fugal/{first}",
-                                       "choices": [{"index": 0, "delta": {},
-                                                    "finish_reason": "stop"}]})
-                            yield b"data: [DONE]\n\n"
-                            return
-
-                        async for line in response.aiter_lines():
-                            line = line.strip()
-                            if not line or not line.startswith("data: "):
-                                continue
-                            data = line[6:]
-                            if data == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-                            u = chunk.get("usage")
-                            if u:
-                                usage = u
-                            choices = chunk.get("choices", [])
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta", {})
-                            if "content" in delta and delta["content"]:
-                                yield sse({"id": cid, "object": "chat.completion.chunk",
-                                           "model": f"fugal/{first}",
-                                           "choices": [{"index": 0,
-                                                        "delta": {"content": delta["content"]},
-                                                        "finish_reason": None}]})
-                            if "tool_calls" in delta:
-                                for tc in delta["tool_calls"]:
-                                    idx = tc.get("index", 0)
-                                    if idx not in accumulated_tcalls:
-                                        accumulated_tcalls[idx] = {
-                                            "id": tc.get("id", ""), "type": "function",
-                                            "function": {"name": "", "arguments": ""}}
-                                    if tc.get("id"):
-                                        accumulated_tcalls[idx]["id"] = tc["id"]
-                                    fn = tc.get("function", {})
-                                    if fn.get("name"):
-                                        accumulated_tcalls[idx]["function"]["name"] = fn["name"]
-                                    if "arguments" in fn:
-                                        accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
-            except Exception as exc:
-                yield sse({"id": cid, "object": "chat.completion.chunk",
-                           "model": f"fugal/{first}",
-                           "choices": [{"index": 0,
-                                        "delta": {"content": f"\n\n[stream error: {str(exc)[:100]}]"},
-                                        "finish_reason": None}]})
-
-            settle()
-
-            tcalls = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+            yield sse({"role": "assistant", "content": ""},
+                      fugal={"stage": "route", "model": first, "p_solve": meta["p_solve"]})
+            async for text in worker_stream(payload, acct):
+                yield sse({"content": text})
+            settle(acct, meta, public, hist, "stream ok")
+            tcalls = meta.get("tool_calls")
             if tcalls:
-                meta["tool_calls"] = tcalls
-                yield sse({"id": cid, "object": "chat.completion.chunk",
-                           "model": f"fugal/{first}",
-                           "choices": [{"index": 0, "delta": {"tool_calls": tcalls},
-                                        "finish_reason": None}]})
-
-            yield sse({"id": cid, "object": "chat.completion.chunk",
-                       "model": f"fugal/{first}",
-                       "choices": [{"index": 0, "delta": {},
-                                    "finish_reason": "tool_calls" if tcalls else "stop"}],
-                       "fugal": {"meta": meta}})
+                yield sse({"tool_calls": tcalls})
+            yield sse({}, finish="tool_calls" if tcalls else "stop", fugal={"meta": meta})
             yield b"data: [DONE]\n\n"
         finally:
-            settle()
+            settle(acct, meta, public, hist, "stream ok")
 
-    async def _stream_anthropic(q, rq, public, hist, tools, msgs, csys, mtok, req_id,
-                                temperature=None):
-        """Real SSE streaming for the Anthropic Messages wire shape via httpx."""
-        ranked, probs = await asyncio.to_thread(
-            f2.route, rq, history=hist if f2.head_context == "multiturn" else None)
-        first = ranked[0]
-        mid = "msg_" + uuid.uuid4().hex[:24]
-        meta = {"p_solve": float(probs[0]), "ranked": list(ranked[:3]),
-                "final_model": first, "cost": 0.0, "steps": [],
-                "input_tokens": 0, "output_tokens": 0}
-        accumulated_tcalls = {}
-        usage = {}
-        settled = False
-
-        def settle():
-            # Same contract as _stream_openai's settle(): exactly once, disconnect-safe.
-            nonlocal settled
-            if settled:
-                return
-            settled = True
-            itok = int(usage.get("prompt_tokens", 0))
-            otok = int(usage.get("completion_tokens", 0))
-            cost = f2._price(first, itok, otok)
-            meta["cost"] = cost
-            meta["input_tokens"] = itok
-            meta["output_tokens"] = otok
-            meta["steps"].append({"role": "worker", "model": first, "cost": cost})
-            add_spend(cost, public)
-            print(f"[serve] anthropic stream ok  worker={first}  "
-                  f"${cost:.5f}  hist={len(hist or [])}  "
-                  f"tier={'public' if public else 'full'}", flush=True)
-
-        lf = chr(10)
+    async def stream_anthropic(q, rq, public, hist, tools, msgs, csys, mtok, temperature):
+        first, meta, payload, acct = await open_stream(q, rq, hist, tools, msgs, csys, mtok,
+                                                       temperature)
 
         def sse(kind, obj):
-            return ("event: " + kind + lf + "data: " + json.dumps(obj) + lf + lf).encode()
+            return f"event: {kind}\ndata: {json.dumps(obj)}\n\n".encode()
 
+        def block(index, kind, blk):
+            return sse(kind, {"type": kind, "index": index, **blk})
+
+        mid = "msg_" + uuid.uuid4().hex[:24]
         try:
             yield sse("message_start", {"type": "message_start", "message": {
                 "id": mid, "type": "message", "role": "assistant",
                 "model": f"fugal/{first}", "content": [],
                 "stop_reason": None, "stop_sequence": None,
                 "usage": {"input_tokens": 0, "output_tokens": 0}}})
-            yield sse("content_block_start", {"type": "content_block_start", "index": 0,
-                                              "content_block": {"type": "text", "text": ""}})
-
-            sys_prompt = compose_system(csys)
-            mtok_val = clamp_max_tokens(mtok, f2.max_out_tokens.get(first))
-            or_msgs = _build_or_messages(q, hist, tools, msgs, sys_prompt)
-            key = os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-            payload = {"model": first, "max_tokens": mtok_val,
-                       "messages": or_msgs, "stream": True,
-                       "stream_options": {"include_usage": True}}
-            if temperature is not None:
-                payload["temperature"] = temperature
-            if tools:
-                payload["tools"] = tools
-
+            yield block(0, "content_block_start", {"content_block": {"type": "text", "text": ""}})
             yield sse("ping", {"type": "ping", "fugal": {
-                "stage": "route", "model": first, "p_solve": float(probs[0])}})
-
-            try:
-                async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        "POST", OR_URL, json=payload, timeout=180.0,
-                        headers={"Authorization": f"Bearer {key}",
-                                 "Content-Type": "application/json"},
-                    ) as response:
-                        if response.status_code != 200:
-                            body = (await response.aread()).decode(errors="replace")[:200]
-                            yield sse("content_block_delta", {
-                                "type": "content_block_delta", "index": 0,
-                                "delta": {"type": "text_delta",
-                                          "text": f"[upstream error {response.status_code}: {body}]"}})
-                        else:
-                            async for line in response.aiter_lines():
-                                line = line.strip()
-                                if not line or not line.startswith("data: "):
-                                    continue
-                                data = line[6:]
-                                if data == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data)
-                                except json.JSONDecodeError:
-                                    continue
-                                u = chunk.get("usage")
-                                if u:
-                                    usage = u
-                                choices = chunk.get("choices", [])
-                                if not choices:
-                                    continue
-                                delta = choices[0].get("delta", {})
-                                if "content" in delta and delta["content"]:
-                                    yield sse("content_block_delta", {
-                                        "type": "content_block_delta", "index": 0,
-                                        "delta": {"type": "text_delta",
-                                                  "text": delta["content"]}})
-                                if "tool_calls" in delta:
-                                    for tc in delta["tool_calls"]:
-                                        idx = tc.get("index", 0)
-                                        if idx not in accumulated_tcalls:
-                                            accumulated_tcalls[idx] = {
-                                                "id": tc.get("id", ""), "type": "function",
-                                                "function": {"name": "", "arguments": ""}}
-                                        if tc.get("id"):
-                                            accumulated_tcalls[idx]["id"] = tc["id"]
-                                        fn = tc.get("function", {})
-                                        if fn.get("name"):
-                                            accumulated_tcalls[idx]["function"]["name"] = fn["name"]
-                                        if "arguments" in fn:
-                                            accumulated_tcalls[idx]["function"]["arguments"] += fn["arguments"]
-            except Exception as exc:
-                yield sse("content_block_delta", {
-                    "type": "content_block_delta", "index": 0,
-                    "delta": {"type": "text_delta",
-                              "text": f"\n\n[stream error: {str(exc)[:100]}]"}})
-
-            yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-
-            settle()
-
-            tcalls = openai_calls_to_anthropic(
-                [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)])
-            if tcalls:
-                meta["tool_calls"] = [accumulated_tcalls[i] for i in sorted(accumulated_tcalls)]
+                "stage": "route", "model": first, "p_solve": meta["p_solve"]}})
+            async for text in worker_stream(payload, acct):
+                yield block(0, "content_block_delta",
+                            {"delta": {"type": "text_delta", "text": text}})
+            yield block(0, "content_block_stop", {})
+            settle(acct, meta, public, hist, "anthropic stream ok")
+            tcalls = openai_calls_to_anthropic(meta.get("tool_calls"))
             for i, blk in enumerate(tcalls, start=1):
-                yield sse("content_block_start", {
-                    "type": "content_block_start", "index": i,
-                    "content_block": {"type": "tool_use", "id": blk["id"],
-                                      "name": blk["name"], "input": {}}})
-                yield sse("content_block_delta", {
-                    "type": "content_block_delta", "index": i,
-                    "delta": {"type": "input_json_delta",
-                              "partial_json": json.dumps(blk["input"])}})
-                yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
-
+                yield block(i, "content_block_start", {"content_block": {
+                    "type": "tool_use", "id": blk["id"], "name": blk["name"], "input": {}}})
+                yield block(i, "content_block_delta", {"delta": {
+                    "type": "input_json_delta", "partial_json": json.dumps(blk["input"])}})
+                yield block(i, "content_block_stop", {})
             yield sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": "tool_use" if tcalls else "end_turn",
@@ -832,73 +698,53 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
                 "fugal": meta})
             yield sse("message_stop", {"type": "message_stop"})
         finally:
-            settle()
+            settle(acct, meta, public, hist, "anthropic stream ok")
 
-    # ---- CORS/Host middleware (raw ASGI) -----------------------------------------
+    # ---- CORS / Host middleware (raw ASGI) ---------------------------------------
 
-    def _make_middleware(app):
-        async def middleware(scope, receive, send):
-            if scope["type"] != "http":
-                await app(scope, receive, send)
+    def host_name(request):
+        h = (request.headers.get("host") or "").strip().lower()
+        if h.startswith("["):
+            return h[1:h.find("]")] if "]" in h else h
+        return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+    async def middleware(scope, receive, send):
+        if scope["type"] != "http":
+            await inner(scope, receive, send)
+            return
+        request = Request(scope)
+        if loopback_bind and host_name(request) not in hosts_ok:
+            await _err(403, "Host header not allowed; reach this server as localhost, "
+                            "or pass --allow-host", "permission_error")(scope, receive, send)
+            return
+        extra = cors_headers(request)
+        if request.method == "OPTIONS":
+            if request.headers.get("origin") and not extra:
+                await _err(403, "origin not allowed; start the server with "
+                                "--cors-origin https://your.app",
+                           "permission_error")(scope, receive, send)
                 return
-            request = Request(scope)
+            await Response(status_code=204, headers={
+                **extra,
+                "access-control-allow-methods": "GET, POST, OPTIONS",
+                "access-control-allow-headers":
+                    "Authorization, Content-Type, x-api-key, anthropic-version",
+                "connection": "close"})(scope, receive, send)
+            return
+        if not extra:
+            await inner(scope, receive, send)
+            return
 
-            # Host check (loopback binds only)
-            if loopback_bind:
-                h = (request.headers.get("host") or "").strip().lower()
-                if h.startswith("["):
-                    name = h[1:h.find("]")] if "]" in h else h
-                elif h:
-                    name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
-                else:
-                    name = ""
-                if name not in hosts_ok:
-                    r = JSONResponse(
-                        {"error": {"message": "Host header not allowed; reach this server "
-                                               "as localhost, or pass --allow-host",
-                                   "type": "permission_error"}}, status_code=403)
-                    await r(scope, receive, send)
-                    return
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers += [(k.encode(), v.encode()) for k, v in extra.items()]
+                message = {**message, "headers": headers}
+            await send(message)
 
-            # OPTIONS (CORS preflight)
-            if request.method == "OPTIONS":
-                origin = request.headers.get("origin")
-                c = cors_headers(request)
-                if origin and not c:
-                    r = JSONResponse(
-                        {"error": {"message": "origin not allowed; start the server with "
-                                               "--cors-origin https://your.app",
-                                   "type": "permission_error"}}, status_code=403)
-                    await r(scope, receive, send)
-                    return
-                r = Response(status_code=204, headers={
-                    **c,
-                    "access-control-allow-methods": "GET, POST, OPTIONS",
-                    "access-control-allow-headers":
-                        "Authorization, Content-Type, x-api-key, anthropic-version",
-                    "connection": "close"})
-                await r(scope, receive, send)
-                return
+        await inner(scope, receive, send_with_cors)
 
-            # Inject CORS headers into every response
-            origin = request.headers.get("origin")
-            extra = cors_headers(request)
-
-            async def send_with_cors(message):
-                if message["type"] == "http.response.start" and extra:
-                    headers = list(message.get("headers", []))
-                    for k, v in extra.items():
-                        headers.append((k.encode(), v.encode()))
-                    message = {**message, "headers": headers}
-                await send(message)
-
-            await app(scope, receive, send_with_cors if extra else send)
-
-        return middleware
-
-    # ---- build the app -----------------------------------------------------------
-
-    routes = [
+    inner = Starlette(routes=[
         Route("/health", health, methods=["GET"]),
         Route("/v1/models", models_list, methods=["GET"]),
         Route("/v1/route", route_only, methods=["POST"]),
@@ -907,23 +753,31 @@ def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
         Route("/chat/completions", chat_completions, methods=["POST"]),
         Route("/v1/messages", messages, methods=["POST"]),
         Route("/messages", messages, methods=["POST"]),
-    ]
+    ])
+    return middleware
 
-    inner = Starlette(routes=routes)
 
-    # Wrap with CORS/Host middleware
-    app = _make_middleware(inner)
+def serve(port, host="127.0.0.1", spend_cap=None, daily_cap=None, rate_limit=6,
+          router_lambda=None, models=None, cors_origins=None, allow_hosts=None):
+    """Load the router, build the app, print what it is doing, and serve it with uvicorn."""
+    f2 = Fugal(models=models, router_lambda=router_lambda)
+    token = os.environ.get("FUGAL_SERVE_TOKEN")
+    app = build_app(f2, host=host, token=token, spend_cap=spend_cap, daily_cap=daily_cap,
+                    rate_limit=rate_limit, cors_origins=cors_origins, allow_hosts=allow_hosts)
 
-    # ---- startup banner ----------------------------------------------------------
     auth = "bearer-auth ON" if token else "no auth (bind localhost only)"
     cap = f"spend cap ${spend_cap}" if spend_cap is not None else "no spend cap"
     pub = (f"public tier ON: ${daily_cap}/day, {rate_limit}/min/IP"
            if daily_cap is not None else "public tier OFF (token required for answers)")
+    fmt = f"{f2.head_format} head" + (" (routing costs frozen at fit time — "
+                                      "docs/HEAD_FORMAT.md)" if f2.head_format == "v1" else "")
+    cors = sorted(set(cors_origins or []))
+    hosts = sorted(LOOPBACK | {h.lower() for h in (allow_hosts or [])})
     print(f"Fugal serving on http://{host}:{port}/v1/chat/completions  [{auth}; {cap}; {pub}]")
     print(f"  routing among {len(f2.models)} models, lambda={f2.lam:g}, "
-          f"head context={f2.head_context}")
-    print(f"  browser: CORS {'allowed for ' + ', '.join(sorted(cors)) if cors else 'OFF'}"
-          f"; Host check {'ON (' + ', '.join(sorted(hosts_ok)) + ')' if loopback_bind else 'OFF (non-loopback bind)'}")
+          f"head context={f2.head_context}, {fmt}")
+    print(f"  browser: CORS {'allowed for ' + ', '.join(cors) if cors else 'OFF'}; "
+          f"Host check {'ON (' + ', '.join(hosts) + ')' if host in LOOPBACK else 'OFF (non-loopback bind)'}")
     if not (os.environ.get("FUGAL_API_KEY") or os.environ.get("OPENROUTER_API_KEY")):
         print("  ⚠ no FUGAL_API_KEY set — POST /v1/route works, answers will fail")
     print("  GET /health · GET /v1/models")

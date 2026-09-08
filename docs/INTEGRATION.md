@@ -229,9 +229,10 @@ remember that the outermost spend brake is the hard limit on the OpenRouter key 
   their prices; `python scripts/refresh_prices.py` re-syncs it, and `--check` reports drift
   without writing. The `mean_cost` used for *routing* is frozen with the head on purpose and
   is not touched.
-- **Cost barely influences routing.** The shipped head is **λ=2.0**, and the accuracy spread
-  across the 17 models is wide enough that price acts as a tiebreaker rather than a driver:
-  `"hi"` routes to `anthropic/claude-sonnet-5`, and still does at `--router-lambda 10`. Where
-  the trade does bite, it bites usefully — on "what is 15% of 240?" a model 0.2 points less
-  likely to be right but 44% cheaper wins. Use `--models` to bound cost by construction if
-  that matters more to you than accuracy.
+- **Cost decides most routes.** With the shipped head, `p_solve` is high and nearly flat
+  across the 17 models (the README's "What this does not claim" has the numbers), so at
+  **λ=2.0** the cheapest capable models win most queries: `"hi"`, `"what is 15% of 240?"`
+  and `"reverse a linked list in python"` all route to `deepseek/deepseek-v4-flash`, and
+  still do at `--router-lambda 10`. A pricier model wins only where the head sees a real
+  gap. Use `--models` to bound the pool if you want a floor on capability rather than a
+  ceiling on cost.

@@ -8,7 +8,6 @@ state into a model choice — sigmoid, L2 normalization, utility ranking, and th
 price lookup that feeds spend caps. The head is synthesized inline with known values
 so every expected output can be computed by hand.
 """
-import io
 import json
 import os
 import tempfile
@@ -16,7 +15,7 @@ import unittest
 
 import numpy as np
 
-from fugal.router import clamp_max_tokens, load_head, load_prices
+from fugal.router import load_head, load_prices
 
 
 def _make_head(tmp, n=3, dim=4, lam=2.0, v2=False, context=None):

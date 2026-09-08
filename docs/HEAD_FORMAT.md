@@ -16,7 +16,7 @@ mean_in_tokens   (17,)       float64   mean input tokens per query, measured at 
 mean_out_tokens  (17,)       float64   mean output tokens per query, measured at fit time
 context          scalar      str       "standalone" (default when absent) or "multiturn"
 
-# v1 heads (the currently shipped head; supported, with a startup note)
+# v1 heads (the currently shipped head; supported, the server banner says so)
 mean_cost        (17,)       float64   mean USD per query, measured at fit-time PRICES
 ```
 
@@ -37,7 +37,7 @@ That split is deliberate: how many tokens a query averages is a *measurement*, f
 the head, but what those tokens cost is a *market fact* that moves — so
 `scripts/refresh_prices.py` keeps the routing trade-off itself honest. A v1 head bakes the
 whole `mean_cost` in, which freezes fit-time prices into every routing decision; it still
-works, with a startup note saying so.
+works; the server banner says which format it loaded.
 
 `context` declares what transcript distribution the head was fit on. The router feeds
 conversation history into the forward pass **only** for a `"multiturn"` head; a

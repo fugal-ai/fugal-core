@@ -5,15 +5,20 @@ Small repo, few rules. The ones below exist because breaking them is silent.
 ## Run this before you open a PR
 
 ```bash
-python -m compileall -q fugal scripts verify tests
-python -m unittest discover -s tests                 # milliseconds, no backbone, no network
+ruff check .                                         # the few rules in pyproject.toml
+python -m unittest discover -s tests                 # <1s, no backbone, no network
 python verify/verify_head.py                         # <1s, no backbone, no network
 python verify/verify_routing.py                      # needs the backbone; no key, no spend
 python -m fugal --route "what is 15% of 240?"        # $0
 ```
 
-The first three need nothing but `numpy` — there is no excuse for skipping them. CI runs the
-same things, plus a string-hygiene gate and a check that browsers really are locked out.
+The first three need nothing heavier than `numpy` and `starlette` — there is no excuse for
+skipping them. CI runs the same things, plus a string-hygiene gate and a check that browsers
+really are locked out of a real server.
+
+`tests/test_server.py` drives the whole server through `build_app()` with a fake router, so
+a change to auth, caps, CORS, the Host check or either streaming shape gets a test there,
+not a manual `curl`.
 
 Touching the price sheet? `python scripts/refresh_prices.py --check` reports drift without
 writing. Touching the head, or fitting your own? `docs/EVALUATION.md` is how you find out
