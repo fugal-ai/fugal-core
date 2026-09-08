@@ -58,7 +58,19 @@ def sigmoid(x):
 
 print("\n  head properties (pure numpy — no backbone, no network, $0)\n")
 
-z = np.load(HEAD)
+from fugal import success_contract as success  # noqa: E402
+from fugal.router import load_head, load_prices  # noqa: E402
+with open(HEAD, "rb") as f:
+    arrays = success.read_archive(f.read(success.MAX_BYTES + 1))
+if "contract" in arrays:
+    head = load_head(HEAD, load_prices(PRICES)[0])
+    h = np.zeros(1024)
+    probabilities = success.predictions(head.W, head.b, h)
+    order = success.rank(probabilities, head.mean_cost, head.lam)
+    print(f"PASS {head.fmt}: {len(head.models)} models; reference selection {head.models[order[0]]}")
+    print("Compatibility only; calibration and routing quality require held-out evidence.")
+    sys.exit(0)
+z = np.load(HEAD, allow_pickle=False)
 files = set(z.files)
 v2 = "mean_in_tokens" in files
 

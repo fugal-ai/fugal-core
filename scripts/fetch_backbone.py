@@ -41,7 +41,7 @@ def revision():
     """The head's declared backbone revision, else the default pin."""
     try:
         import numpy as np
-        z = np.load(HEAD)
+        z = np.load(HEAD, allow_pickle=False)
         if "backbone_revision" in z.files and str(z["backbone_revision"]):
             return str(z["backbone_revision"]), "declared by " + os.path.relpath(HEAD, REPO)
     except (OSError, ValueError):

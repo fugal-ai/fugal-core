@@ -1,0 +1,126 @@
+{
+  "version": "fugal-success-v1",
+  "profile_id": "1910b573b2406b62ea13b691e411e91bfec2dcf3ab7a9beb2ad01444ab227565",
+  "questions": [
+    "short question",
+    "Café 🙂 漢字",
+    "line one\nline two",
+    "",
+    {
+      "repeat": "overflow ",
+      "count": 2600
+    }
+  ],
+  "token_lengths": [
+    37,
+    41,
+    40,
+    36,
+    2048
+  ],
+  "token_ids_sha256": "7b32e8bc3cd303ca70c3763cccecad9ca4e9b21e18504a94489694e281389588",
+  "cases": [
+    {
+      "name": "saturation",
+      "logits": [
+        -1000,
+        0,
+        1000
+      ],
+      "costs": [
+        0,
+        0,
+        0
+      ],
+      "lam": 1,
+      "order": [
+        2,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "row-order-tie",
+      "logits": [
+        0,
+        0,
+        0
+      ],
+      "costs": [
+        0.001,
+        0.001,
+        0.001
+      ],
+      "lam": 1,
+      "order": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "quantized-tie",
+      "logits": [
+        0,
+        4e-05
+      ],
+      "costs": [
+        0,
+        0
+      ],
+      "lam": 1,
+      "order": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "cost-at-one",
+      "logits": [
+        0,
+        0.4
+      ],
+      "costs": [
+        0,
+        0.2
+      ],
+      "lam": 1,
+      "order": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "lambda-zero",
+      "logits": [
+        0,
+        0.4
+      ],
+      "costs": [
+        0,
+        0.2
+      ],
+      "lam": 0,
+      "order": [
+        1,
+        0
+      ]
+    },
+    {
+      "name": "updated-prices",
+      "logits": [
+        0,
+        0.4
+      ],
+      "costs": [
+        0,
+        0.01
+      ],
+      "lam": 1,
+      "order": [
+        1,
+        0
+      ]
+    }
+  ]
+}

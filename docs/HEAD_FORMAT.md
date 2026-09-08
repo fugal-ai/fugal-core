@@ -172,3 +172,9 @@ quantity is `E[cost | query, model]`; the input half is already known at routing
 query's own token count), and the output half could become a per-query prediction. Both are
 head-format extensions: when they land they will be new declared arrays here, not code
 changes.
+
+## Explicit success contract
+
+New `fugal-success-v1` heads have a distinct, strictly validated artifact and
+embedding profile. See [SUCCESS_CONTRACT.md](SUCCESS_CONTRACT.md). Existing v1/v2
+heads keep the behavior documented above; they are never reinterpreted.
